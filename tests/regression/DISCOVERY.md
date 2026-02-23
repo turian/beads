@@ -1123,6 +1123,15 @@ list but is missing two fields:
 Any user who migrates from SQLite to Dolt via `bd migrate --to-dolt` loses
 all custom metadata and spec associations. This is a real data loss path.
 
+**Note:** Separate from the `bd update` path regressions tracked by the
+existing (skipped) protocol tests in `scenarios_test.go`:
+- `TestExternalRefSpecID` (line 126) — `spec_id` dropped by Dolt `UpdateIssue`
+- `TestMetadataRoundTrip` (line 367) — metadata dropped (GH#1912)
+
+The `CreateIssuesWithFullOptions` import path at `issues.go:942` **does**
+include both columns, so the `bd import` path may be fine. BUG-21 is
+specific to the `importToDolt` migration function in `migrate_dolt.go`.
+
 ---
 
 ### AREA 7: Cross-Rig Routing and External Dependencies
