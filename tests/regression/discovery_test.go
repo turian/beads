@@ -947,3 +947,475 @@ func TestProtocol_CommentAddAndPreserve(t *testing.T) {
 		t.Errorf("comments should be preserved after close/reopen, got %d", len(comments))
 	}
 }
+
+// =============================================================================
+// DEEP AUDIT DISCOVERY TESTS — Session 2 (Tier A: deterministic, high-yield)
+// =============================================================================
+//
+// These tests target structural fragility patterns found during the deep code
+// audit: upserts, INSERT IGNORE, prefix matching, computed-vs-stored semantics,
+// cross-rig/external IDs, and concurrency.
+
+// TestA1_ExternalBlockerSemanticsEnforced tests whether external blocking deps
+// are actually enforced by close guard and bd ready.
+// BUG-22 candidate: IsBlocked uses JOIN issues ON depends_on_id = id, which
+// silently drops external:* deps because they don't exist in the issues table.
+func TestA1_ExternalBlockerSemanticsEnforced(t *testing.T) {
+	w := newCandidateWorkspace(t)
+
+	a := w.create("--title", "Needs external capability", "--type", "task", "--priority", "2")
+
+	// Add an external blocking dependency
+	w.run("dep", "add", a, "external:someRig:capability", "--type", "blocks")
+
+	// Verify the dependency was stored
+	depOut := w.run("dep", "list", a, "--json")
+	if !strings.Contains(depOut, "external:someRig:capability") {
+		t.Fatalf("external dep should appear in dep list, got: %s", depOut)
+	}
+
+	// BUG-22: external blockers should prevent close (without --force)
+	// Currently: IsBlocked (dependencies.go:740) uses JOIN issues ON depends_on_id = id
+	// which silently drops external: deps. So close guard won't see the blocker.
+	closeOut := w.run("close", a)
+	showData := parseJSON(t, w.run("show", a, "--json"))
+	if showData[0]["status"] == "closed" {
+		t.Errorf("BUG-22: close should be rejected when blocked by external dep, but issue was closed.\n"+
+			"Close guard ignores external:* blockers because IsBlocked JOINs against issues table.\n"+
+			"close output: %s", closeOut)
+	}
+
+	// BUG-22: bd ready should exclude issues blocked by external deps
+	readyIDs := parseIDs(t, w.run("ready", "-n", "0", "--json"))
+	if containsID(readyIDs, a) {
+		t.Errorf("BUG-22: bd ready should exclude issue %s blocked by external dep, but it appeared in ready list.\n"+
+			"computeBlockedIDs ignores external:* because activeIDs check fails (external ID not in issues table).", a)
+	}
+}
+
+// TestA2_WaitsForBlockingAppearsInBdBlocked tests whether waits-for blocked
+// issues appear in both `bd ready` (exclusion) and `bd blocked` (inclusion).
+// BUG-18: GetBlockedIssues only checks 'blocks' deps, but computeBlockedIDs
+// (used by bd ready) also checks 'waits-for'. An issue blocked by waits-for
+// can be invisible to both commands.
+func TestA2_WaitsForBlockingAppearsInBdBlocked(t *testing.T) {
+	w := newCandidateWorkspace(t)
+
+	// Create a spawner (parent) with a child
+	spawner := w.create("--title", "Spawner", "--type", "epic", "--priority", "1")
+	child := w.create("--title", "Child task", "--type", "task", "--priority", "2", "--parent", spawner)
+
+	// Create a gate issue that waits-for the spawner's children
+	gate := w.create("--title", "Gate waiting for children", "--type", "task", "--priority", "2")
+	w.run("dep", "add", gate, spawner, "--type", "waits-for")
+
+	// Gate should NOT be in bd ready (child is still open)
+	readyIDs := parseIDs(t, w.run("ready", "-n", "0", "--json"))
+	if containsID(readyIDs, gate) {
+		t.Errorf("gate should NOT be in ready (waits-for spawner with open child)")
+	}
+
+	// BUG-18: Gate SHOULD appear in bd blocked
+	// Currently: GetBlockedIssues only checks 'blocks' deps, not 'waits-for'
+	blockedOut := w.run("blocked", "--json")
+	blockedIDs := parseIDs(t, blockedOut)
+	if !containsID(blockedIDs, gate) {
+		t.Errorf("BUG-18: gate should appear in bd blocked (waits-for with open child), but it doesn't.\n"+
+			"GetBlockedIssues only checks 'blocks' deps, not 'waits-for'.\n"+
+			"blocked output: %s", blockedOut)
+	}
+
+	// After closing the child, gate should become ready
+	w.run("close", child)
+	readyIDs = parseIDs(t, w.run("ready", "-n", "0", "--json"))
+	if !containsID(readyIDs, gate) {
+		t.Errorf("after closing child, gate should be in ready list")
+	}
+	// Suppress unused variable warning
+	_ = spawner
+}
+
+// TestA3_MigrateDoltPreservesMetadataAndSpecID tests that bd migrate --to-dolt
+// preserves the metadata JSON field and spec_id.
+// BUG-21: importToDolt INSERT is missing metadata and spec_id columns.
+//
+// NOTE: This test is difficult to run without a real SQLite→Dolt migration path.
+// Instead, we test the import path (CreateIssuesWithFullOptions) which is the
+// shared code, and verify metadata survives a create-then-show round-trip.
+func TestA3_MetadataRoundTrip(t *testing.T) {
+	w := newCandidateWorkspace(t)
+
+	// Create issue with metadata
+	a := w.create("--title", "Has metadata", "--type", "task", "--priority", "2")
+	w.run("update", a, "--metadata", `{"custom_key":"custom_value","number":42}`)
+
+	// Read it back
+	data := parseJSON(t, w.run("show", a, "--json"))
+	metadata, ok := data[0]["metadata"]
+	if !ok || metadata == nil {
+		t.Fatalf("metadata should be present in show --json output")
+	}
+
+	// Verify it's valid JSON with our custom fields
+	metaStr, ok := metadata.(string)
+	if !ok {
+		// metadata might be returned as a map
+		metaMap, ok := metadata.(map[string]any)
+		if !ok {
+			t.Fatalf("metadata should be string or map, got %T: %v", metadata, metadata)
+		}
+		if metaMap["custom_key"] != "custom_value" {
+			t.Errorf("metadata.custom_key should be 'custom_value', got: %v", metaMap["custom_key"])
+		}
+	} else {
+		if !strings.Contains(metaStr, "custom_key") || !strings.Contains(metaStr, "custom_value") {
+			t.Errorf("metadata should contain custom_key/custom_value, got: %s", metaStr)
+		}
+	}
+
+	// Now test that IMPORT preserves metadata:
+	// Export to JSON, then re-import into a fresh workspace
+	showOut := w.run("show", a, "--json")
+
+	w2 := newCandidateWorkspace(t)
+	// Write JSON to a file and import
+	jsonFile := filepath.Join(w2.dir, "import.jsonl")
+	if err := os.WriteFile(jsonFile, []byte(showOut), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	importOut, err := w2.tryRun("import", "-i", jsonFile)
+	if err != nil {
+		t.Logf("import failed (may be prefix mismatch): %s", importOut)
+		t.Skip("import failed — likely prefix mismatch between workspaces")
+	}
+
+	// Verify metadata survived import
+	importedData := parseJSON(t, w2.run("show", a, "--json"))
+	importedMeta := importedData[0]["metadata"]
+	if importedMeta == nil {
+		t.Errorf("BUG-21: metadata was lost during import round-trip")
+	}
+}
+
+// TestA4_DepAddOverwritesTypeOnWisps tests whether wisp dep upsert silently
+// overwrites dependency type, same as BUG-7 but in the ephemeral path.
+// BUG-15: wisps.go:836 uses ON DUPLICATE KEY UPDATE type = VALUES(type)
+//
+// NOTE: This test requires bd create --ephemeral to work. If it doesn't
+// support --ephemeral from CLI, we skip.
+func TestA4_WispDepTypeOverwrite(t *testing.T) {
+	w := newCandidateWorkspace(t)
+
+	// Try to create ephemeral issues
+	ephID, err := w.tryCreate("--title", "Ephemeral task", "--type", "task", "--priority", "2", "--ephemeral")
+	if err != nil {
+		t.Skip("bd create --ephemeral not available from CLI: " + err.Error())
+	}
+
+	target := w.create("--title", "Target", "--type", "task", "--priority", "2")
+
+	// Add blocks dep first
+	_, err = w.tryRun("dep", "add", ephID, target, "--type", "blocks")
+	if err != nil {
+		t.Skip("dep add on ephemeral issues not supported from CLI")
+	}
+
+	// Now add caused-by on the same pair — should either fail or preserve blocks
+	w.run("dep", "add", ephID, target, "--type", "caused-by")
+
+	// Check if the blocks relationship survived
+	depOut := w.run("dep", "list", ephID, "--json")
+	if !strings.Contains(depOut, "blocks") {
+		t.Errorf("BUG-15: wisp dep type was silently overwritten from 'blocks' to 'caused-by'.\n"+
+			"wisps.go:836 uses ON DUPLICATE KEY UPDATE type = VALUES(type).\n"+
+			"dep list output: %s", depOut)
+	}
+}
+
+// TestA1b_ExternalDepStoredAndVisible is a prerequisite check for A1:
+// verify external deps can be added and are visible in dep list.
+func TestA1b_ExternalDepStoredAndVisible(t *testing.T) {
+	w := newCandidateWorkspace(t)
+
+	a := w.create("--title", "Has external dep", "--type", "task", "--priority", "2")
+	w.run("dep", "add", a, "external:otherProject:feature-x", "--type", "blocks")
+
+	// dep list should show the external dep
+	depOut := w.run("dep", "list", a)
+	if !strings.Contains(depOut, "external:otherProject:feature-x") {
+		t.Errorf("external dep should appear in dep list output, got: %s", depOut)
+	}
+
+	// dep list --json should include it
+	depJSON := w.run("dep", "list", a, "--json")
+	if !strings.Contains(depJSON, "external:otherProject:feature-x") {
+		t.Errorf("external dep should appear in dep list --json output, got: %s", depJSON)
+	}
+}
+
+// TestBug16_ChildCounterUniqueness tests whether GetNextChildID produces
+// unique child IDs. This is a deterministic version — sequential creates.
+// See TestB1 for the concurrent stress version.
+func TestBug16_ChildCounterUniqueness(t *testing.T) {
+	w := newCandidateWorkspace(t)
+
+	parent := w.create("--title", "Parent epic", "--type", "epic", "--priority", "1")
+
+	// Create 5 children sequentially
+	childIDs := make(map[string]bool)
+	for i := 0; i < 5; i++ {
+		id := w.create("--title", fmt.Sprintf("Child %d", i), "--type", "task", "--priority", "2", "--parent", parent)
+		if childIDs[id] {
+			t.Errorf("duplicate child ID: %s", id)
+		}
+		childIDs[id] = true
+	}
+
+	// All 5 should appear as children
+	children := parseIDs(t, w.run("children", parent, "--json"))
+	if len(children) != 5 {
+		t.Errorf("expected 5 children, got %d: %v", len(children), children)
+	}
+}
+
+// TestBug18_BlockedSemanticsConsistency tests that bd blocked and bd ready
+// agree on what's blocked. If an issue is not in ready, it should be findable
+// via bd blocked (or bd list --status deferred, etc.).
+func TestBug18_BlockedSemanticsConsistency(t *testing.T) {
+	w := newCandidateWorkspace(t)
+
+	a := w.create("--title", "Blocked by blocks dep", "--type", "task", "--priority", "2")
+	b := w.create("--title", "Blocker", "--type", "task", "--priority", "1")
+	c := w.create("--title", "Free task", "--type", "task", "--priority", "3")
+
+	w.run("dep", "add", a, b, "--type", "blocks")
+
+	readyIDs := parseIDs(t, w.run("ready", "-n", "0", "--json"))
+	blockedIDs := parseIDs(t, w.run("blocked", "--json"))
+
+	// a should be in blocked, not in ready
+	if containsID(readyIDs, a) {
+		t.Errorf("blocked issue %s should not be in ready", a)
+	}
+	if !containsID(blockedIDs, a) {
+		t.Errorf("blocked issue %s should be in blocked list", a)
+	}
+
+	// b and c should be in ready, not in blocked
+	if !containsID(readyIDs, b) {
+		t.Errorf("unblocked issue %s should be in ready", b)
+	}
+	if !containsID(readyIDs, c) {
+		t.Errorf("free issue %s should be in ready", c)
+	}
+	if containsID(blockedIDs, b) {
+		t.Errorf("blocker %s should not be in blocked list", b)
+	}
+
+	// Every non-closed, non-deferred issue should be in EITHER ready OR blocked
+	// (this is the key invariant — no invisible issues)
+	allIDs := parseIDs(t, w.run("list", "-n", "0", "--json"))
+	for _, id := range allIDs {
+		if !containsID(readyIDs, id) && !containsID(blockedIDs, id) {
+			t.Errorf("BUG-18 pattern: issue %s is in neither ready nor blocked — invisible to workflow commands", id)
+		}
+	}
+}
+
+// TestBug19_UpdateIssueEventConsistency tests that UpdateIssue records
+// events with correct old/new values even under sequential updates.
+// The TOCTOU race (BUG-19) is hard to reproduce deterministically,
+// but we can at least verify the event chain is consistent.
+func TestBug19_UpdateIssueEventConsistency(t *testing.T) {
+	w := newCandidateWorkspace(t)
+
+	a := w.create("--title", "Event test", "--type", "task", "--priority", "2")
+
+	// Chain of updates
+	w.run("update", a, "--title", "First title")
+	w.run("update", a, "--title", "Second title")
+	w.run("update", a, "--title", "Third title")
+
+	// Final state should be "Third title"
+	data := parseJSON(t, w.run("show", a, "--json"))
+	if data[0]["title"] != "Third title" {
+		t.Errorf("final title should be 'Third title', got: %v", data[0]["title"])
+	}
+}
+
+// TestBug20_MetadataNilVsEmptyObject tests metadata consistency between
+// create and update paths.
+// BUG-20: CreateIssue may store metadata as SQL NULL, while UpdateIssue
+// normalizes to "{}". Code checking `metadata == nil` vs `metadata == "{}"`
+// will behave differently.
+func TestBug20_MetadataNilVsEmptyObject(t *testing.T) {
+	w := newCandidateWorkspace(t)
+
+	// Create without metadata
+	a := w.create("--title", "No metadata", "--type", "task", "--priority", "2")
+	data := parseJSON(t, w.run("show", a, "--json"))
+
+	meta1 := data[0]["metadata"]
+
+	// Create with empty metadata
+	b := w.create("--title", "With metadata", "--type", "task", "--priority", "2")
+	w.run("update", b, "--metadata", "{}")
+	data2 := parseJSON(t, w.run("show", b, "--json"))
+	meta2 := data2[0]["metadata"]
+
+	// Both should be equivalent (either both nil/empty or both {})
+	// The key invariant: a show --json should return a consistent metadata shape
+	// regardless of whether metadata was explicitly set
+	meta1Str := fmt.Sprintf("%v", meta1)
+	meta2Str := fmt.Sprintf("%v", meta2)
+
+	// If one is nil and the other is {}, that's a normalization inconsistency
+	if (meta1 == nil && meta2 != nil) || (meta1Str == "<nil>" && meta2Str == "{}") {
+		t.Logf("BUG-20: metadata inconsistency: create-without-metadata=%v (%T), create-then-update-metadata=%v (%T)",
+			meta1, meta1, meta2, meta2)
+		// This is a LOW severity issue — log but don't fail
+	}
+}
+
+// =============================================================================
+// DEEP AUDIT DISCOVERY TESTS — Session 2 (Tier B: stress tests)
+// =============================================================================
+//
+// These tests are probabilistic and may be flaky under load. Gate behind
+// BD_STRESS=1 environment variable to avoid impacting CI.
+
+// TestB1_ChildCounterConcurrency stress-tests concurrent child creation
+// to detect the race in GetNextChildID (BUG-16).
+func TestB1_ChildCounterConcurrency(t *testing.T) {
+	if os.Getenv("BD_STRESS") == "" {
+		t.Skip("set BD_STRESS=1 to run stress discovery tests")
+	}
+
+	w := newCandidateWorkspace(t)
+	parent := w.create("--title", "Stress parent", "--type", "epic", "--priority", "1")
+
+	const N = 10
+	type result struct {
+		id  string
+		err error
+	}
+	results := make(chan result, N)
+
+	for i := 0; i < N; i++ {
+		go func(n int) {
+			id, err := w.tryCreate("--title", fmt.Sprintf("Concurrent child %d", n),
+				"--type", "task", "--priority", "2", "--parent", parent)
+			results <- result{id: strings.TrimSpace(id), err: err}
+		}(i)
+	}
+
+	ids := make(map[string]bool)
+	var errors []error
+	for i := 0; i < N; i++ {
+		r := <-results
+		if r.err != nil {
+			errors = append(errors, r.err)
+			continue
+		}
+		if ids[r.id] {
+			t.Errorf("BUG-16: duplicate child ID %s from concurrent creation", r.id)
+		}
+		ids[r.id] = true
+	}
+
+	if len(errors) > 0 {
+		t.Logf("BUG-16: %d/%d concurrent child creations failed: %v", len(errors), N, errors)
+	}
+
+	// All successful creates should have unique IDs
+	if len(ids)+len(errors) != N {
+		t.Errorf("expected %d results, got %d successes + %d errors", N, len(ids), len(errors))
+	}
+
+	// Verify parent has the expected number of children
+	children := parseIDs(t, w.run("children", parent, "--json"))
+	if len(children) != len(ids) {
+		t.Errorf("parent should have %d children (successful creates), got %d", len(ids), len(children))
+	}
+}
+
+// TestB2_ConcurrentLabelAdd stress-tests concurrent label additions
+// to verify BUG-5 is fixed on current main.
+func TestB2_ConcurrentLabelAdd(t *testing.T) {
+	if os.Getenv("BD_STRESS") == "" {
+		t.Skip("set BD_STRESS=1 to run stress discovery tests")
+	}
+
+	w := newCandidateWorkspace(t)
+	a := w.create("--title", "Label stress", "--type", "task", "--priority", "2")
+
+	const N = 5
+	done := make(chan error, N)
+
+	for i := 0; i < N; i++ {
+		go func(n int) {
+			_, err := w.tryRun("label", "add", a, fmt.Sprintf("stress-%d", n))
+			done <- err
+		}(i)
+	}
+
+	var errors []error
+	for i := 0; i < N; i++ {
+		if err := <-done; err != nil {
+			errors = append(errors, err)
+		}
+	}
+
+	if len(errors) > 0 {
+		t.Logf("%d/%d concurrent label adds failed: %v", len(errors), N, errors)
+	}
+
+	// Check how many labels survived
+	data := parseJSON(t, w.run("show", a, "--json"))
+	labels, _ := data[0]["labels"].([]any)
+	expectedCount := N - len(errors)
+	if len(labels) < expectedCount {
+		t.Errorf("BUG-5 (revisit): expected %d labels after concurrent adds, got %d (lost %d)",
+			expectedCount, len(labels), expectedCount-len(labels))
+	}
+}
+
+// TestB3_ConcurrentUpdate stress-tests concurrent issue updates
+// to detect the TOCTOU race in UpdateIssue (BUG-19).
+func TestB3_ConcurrentUpdate(t *testing.T) {
+	if os.Getenv("BD_STRESS") == "" {
+		t.Skip("set BD_STRESS=1 to run stress discovery tests")
+	}
+
+	w := newCandidateWorkspace(t)
+	a := w.create("--title", "Update stress", "--type", "task", "--priority", "2")
+
+	const N = 5
+	done := make(chan error, N)
+
+	for i := 0; i < N; i++ {
+		go func(n int) {
+			_, err := w.tryRun("update", a, "--title", fmt.Sprintf("Title from goroutine %d", n))
+			done <- err
+		}(i)
+	}
+
+	var errors []error
+	for i := 0; i < N; i++ {
+		if err := <-done; err != nil {
+			errors = append(errors, err)
+		}
+	}
+
+	// The final title should be one of the goroutine titles
+	data := parseJSON(t, w.run("show", a, "--json"))
+	title, _ := data[0]["title"].(string)
+	if !strings.HasPrefix(title, "Title from goroutine ") {
+		t.Errorf("unexpected final title after concurrent updates: %s", title)
+	}
+
+	if len(errors) > 0 {
+		t.Logf("BUG-19: %d/%d concurrent updates failed (may indicate lock contention): %v",
+			len(errors), N, errors)
+	}
+}

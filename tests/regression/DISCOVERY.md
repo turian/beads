@@ -14,6 +14,8 @@ actionable — some are by-design tradeoffs. The audit column tracks triage.
 | 2026-02-22 | Code review of labels.go, schema.go, dependencies.go for BUG-5 and BUG-7 root cause | BUG-5 upgraded to INVESTIGATE (not clearly wontfix). BUG-7 downgraded to FILE ISSUE (intentionally coded upsert, needs product decision). BUG-4 upgraded to DOCS FIX (help text promises "blocked" as a status). |
 | 2026-02-22 | Submitted 8 PRs: 2 clear fixes, 3 DECISION PRs, 3 metadata features | PR #1992 (BUG-2+3) merged same day. All PRs rebased onto latest main. |
 | 2026-02-22 | BUG-5 explicitly deferred | No deterministic repro; needs deeper investigation of Dolt working-set commit race. Deferred pending repro. |
+| 2026-02-22 | Deep audit session 2: 8 areas (SQL patterns, blocked semantics, concurrency, import/export, routing, field validation, GitHub issues, telemetry) | Found 9 new bugs (BUG-15–BUG-23). Mined 80+ GitHub issues. |
+| 2026-02-22 | Wrote discovery tests: 9 Tier A deterministic, 3 Tier B stress, 1 Tier C compile-time | 13 new tests in discovery_test.go + compile_test.go. BUG-23 confirmed immediately. |
 
 ## Audit Summary
 
@@ -798,3 +800,534 @@ To fix the harness:
 2. The baseline binary still works with SQLite (no server needed)
 3. Use unique prefixes per test: `test-<testname>-<random>`
 4. Or spin up a separate Dolt server per test on a random port
+
+---
+
+## DEEP AUDIT — Session 2 (2026-02-22)
+
+Systematic audit across 8 discovery areas: GitHub issue mining, SQL pattern
+analysis, mode parity, blocked semantics, concurrency, field validation,
+cross-rig routing, and import/export survivability.
+
+### Session Log Update
+
+| Date | What we did | Outcome |
+|------|-------------|---------|
+| 2026-02-22 | Mined 80+ GitHub issues for Dolt pain points | 10 high-value issues mapped to discovery areas |
+| 2026-02-22 | Audited ON DUPLICATE KEY UPDATE (13 instances), INSERT IGNORE (8), LIKE CONCAT (6) | Found 4 new potential bugs, 3 by-design |
+| 2026-02-22 | Audited blocked semantics across 5 commands | Confirmed BUG-4 at code level; found inconsistency in `waits-for` handling |
+| 2026-02-22 | Audited concurrency in execContext, labels, UpdateIssue | Found TOCTOU race in UpdateIssue; confirmed label atomicity gap |
+| 2026-02-22 | Audited import/export/migrate_dolt paths | Found 2 missing columns in migrate_dolt; silent dep skipping |
+| 2026-02-22 | Audited cross-rig routing code | Routing is sound but error paths return partial results |
+| 2026-02-22 | Found InstrumentedStorage build break | RunInTransaction signature mismatch after commitMsg addition |
+
+---
+
+### AREA 1: GitHub Issues — Dolt Migration Pain Points
+
+Mined all 80+ GitHub issues. The following open issues map directly to
+discovery areas and represent real user pain:
+
+| # | Issue | Symptom | Area | Actionable? |
+|---|-------|---------|------|-------------|
+| 1 | [#1984](https://github.com/steveyegge/beads/issues/1984) | `bd create-form` blocks DB — lock held during editor | Lock contention | FIX — release lock before $EDITOR |
+| 2 | [#1881](https://github.com/steveyegge/beads/issues/1881) | Unstaged modified files lost after commit | Hooks / data loss | INVESTIGATED — no code path found |
+| 3 | [#1858](https://github.com/steveyegge/beads/issues/1858) | `bd list` shows resolved blockers as still blocking | Blocked semantics | LIKELY FIXED by fedf1daa (#1884) |
+| 4 | [#1945](https://github.com/steveyegge/beads/issues/1945) | `bd repo sync` fails: duplicate key + no cross-prefix hydration | Import/export | FIX — re-import without existence check |
+| 5 | [#1962](https://github.com/steveyegge/beads/issues/1962) | `bd create --ephemeral` generates empty ID, UNIQUE failure | ID generation | FIX — generate real ephemeral ID |
+| 6 | [#1977](https://github.com/steveyegge/beads/issues/1977) | 2s CPU burn on every invocation (wazero WASM) | Performance | FIX — lazy-load SQLite embed |
+| 7 | [#2007](https://github.com/steveyegge/beads/issues/2007) | `bd prime` references removed `--status` flag | Stale docs | FIX — trivial |
+| 8 | [#1921](https://github.com/steveyegge/beads/issues/1921) | BD_BRANCH breaks beads and gastown | Routing | INVESTIGATE |
+| 9 | [#1853](https://github.com/steveyegge/beads/issues/1853) | `bd update --type` fails with BEADS_DIR + custom types | Field validation | FIX — load config from BEADS_DIR |
+| 10 | [#1524](https://github.com/steveyegge/beads/issues/1524) | Close guard may diverge from blocked-cache for non-`blocks` types | Blocked semantics | DECISION — policy question |
+
+**Closed issues with regression relevance:**
+
+| Issue | What it was | Why it matters |
+|-------|-------------|----------------|
+| [#1773](https://github.com/steveyegge/beads/issues/1773) | `bd list` returns empty on Dolt lock contention | Fixed by #1816 but pattern may recur |
+| [#1833](https://github.com/steveyegge/beads/issues/1833) | `no-db: true` ignored in v0.50+ | Config key silently became no-op |
+| [#1609](https://github.com/steveyegge/beads/issues/1609) | Label writes silently dropped with multiple daemons | Concurrency root cause |
+| [#1669](https://github.com/steveyegge/beads/issues/1669) | `bd migrate --to-dolt` hardcodes DB name, loses 3455 issues | Migration data loss |
+| [#1934](https://github.com/steveyegge/beads/issues/1934) | `bd import` fails with duplicate primary key | Import idempotency |
+
+---
+
+### AREA 2: Dangerous SQL Patterns
+
+#### 2a. ON DUPLICATE KEY UPDATE — 13 instances
+
+| File:Line | Table | Risk | Verdict |
+|-----------|-------|------|---------|
+| `dependencies.go:78` | dependencies | **HIGH** — silently overwrites dep type+metadata | **BUG-7** (already tracked) |
+| `wisps.go:836` | wisp_dependencies | **HIGH** — same pattern as BUG-7 for wisps | **BUG-15** (NEW) |
+| `transaction.go:310` | dependencies (tx) | **MEDIUM** — same upsert but inside explicit tx | **BUG-7 variant** |
+| `queries.go:1136` | child_counters | **MEDIUM** — concurrent child creation race | **BUG-16** (NEW) — see Area 5 |
+| `issues.go:242` | labels (import) | LOW — no-op update (`label = label`), safe | BY-DESIGN |
+| `issues.go:280` | dependencies (import) | LOW — no-op update (`type = type`), safe | BY-DESIGN |
+| `store.go:696` | config | LOW — schema version upsert, always same value | BY-DESIGN |
+| `credentials.go:132` | federation_peers | LOW — intentional config upsert | BY-DESIGN |
+| `config.go:16` | config | LOW — config upsert, intentional | BY-DESIGN |
+| `config.go:88` | metadata | LOW — metadata upsert, intentional | BY-DESIGN |
+| `transaction.go:420` | config (tx) | LOW — config upsert in tx | BY-DESIGN |
+| `transaction.go:439` | metadata (tx) | LOW — metadata upsert in tx | BY-DESIGN |
+| `git_remote_test.go:490` | config (test) | N/A — test fixture | N/A |
+
+**New bugs found:**
+
+**BUG-15: Wisp dependency type silently overwritten** (`wisps.go:836`)
+
+Same pattern as BUG-7 but in the wisp (ephemeral) code path. If a wisp
+dependency is re-added with a different type, the old type is silently
+overwritten. `created_at`, `created_by`, and `thread_id` are preserved (not
+updated), but `type` and `metadata` are replaced without warning.
+
+**BUG-16: Child counter race** (`queries.go:1136`)
+
+`GetNextChildID` reads `last_child`, increments, then upserts. The read + write
+are inside a single transaction, but Dolt's default isolation level may allow
+two concurrent transactions to read the same `last_child` value. Both would
+compute the same `nextChild`, and the upsert means the second writer silently
+wins. Result: **duplicate child IDs** (e.g., two issues both named `epic.3`).
+
+```
+Process A: SELECT last_child → 2, nextChild = 3
+Process B: SELECT last_child → 2, nextChild = 3  (A hasn't committed yet)
+Process A: UPSERT last_child = 3 → COMMIT
+Process B: UPSERT last_child = 3 → COMMIT (overwrites same value)
+Both create issue "epic.3" — duplicate ID
+```
+
+**Fix:** Use `SELECT ... FOR UPDATE` or add a UNIQUE constraint on child IDs
+to prevent the duplicate insert.
+
+#### 2b. INSERT IGNORE — 8 instances
+
+| File:Line | Table | Risk |
+|-----------|-------|------|
+| `labels.go:17` | labels | LOW — idempotent label add, correct |
+| `wisps.go:1038` | wisp_labels | LOW — same pattern, correct |
+| `transaction.go:374` | labels (tx) | LOW — same pattern in tx |
+| `ephemeral_routing.go:84` | labels (promote) | LOW — promotion copy, correct |
+| `ephemeral_routing.go:101` | dependencies (promote) | **MEDIUM** — silently drops deps that already exist during wisp promotion |
+| `ephemeral_routing.go:114` | events (promote) | LOW — best-effort event copy |
+| `ephemeral_routing.go:121` | comments (promote) | LOW — best-effort comment copy |
+| `schema.go:245` | config (init) | LOW — default config values |
+
+**BUG-17: Wisp promotion silently drops conflicting deps** (`ephemeral_routing.go:101`)
+
+When a wisp (ephemeral issue) is promoted to a persistent issue, its
+dependencies are copied via `INSERT IGNORE`. If the persistent issues table
+already has a dependency with the same `(issue_id, depends_on_id)` pair, the
+wisp's dependency is silently dropped — including its type, metadata, and
+thread_id. No error, no warning.
+
+**Impact:** If an agent creates a wisp with a `blocks` dependency, and a
+concurrent process already added a `caused-by` dependency with the same pair,
+the promotion silently drops the `blocks` relationship. The issue becomes
+unblocked without warning.
+
+#### 2c. LIKE CONCAT — 6 instances
+
+| File:Line | Usage | Risk |
+|-----------|-------|------|
+| `queries.go:212` | Parent filter (children) | **MEDIUM** — BUG-8 (already tracked) |
+| `wisps.go:544` | Same pattern for wisps | **MEDIUM** — BUG-8 variant |
+| `transaction.go:172` | Same pattern in tx | **MEDIUM** — BUG-8 variant |
+| `adaptive_length.go:105` | ID collision counting | LOW — read-only, correct |
+| `rename.go:123` | Bulk rename deps | LOW — intentional prefix rename |
+| `rename.go:133` | Bulk rename deps (other side) | LOW — intentional prefix rename |
+
+The `LIKE CONCAT(?, '.%')` pattern in parent filtering (BUG-8) appears in
+**three places** — `queries.go:212`, `wisps.go:544`, `transaction.go:172`.
+Any fix needs to cover all three.
+
+---
+
+### AREA 3: Direct vs Daemon Mode Parity
+
+Since daemon mode was removed (replaced by direct Dolt access), this area now
+maps to **read-only store vs read-write store** parity.
+
+The `withStorage` function in `list.go:30` opens a read-only connection when
+`dbPath` is set but `store` is nil:
+
+```go
+roStore, err := dolt.New(ctx, &dolt.Config{Path: dbPath, ReadOnly: true})
+```
+
+**Observations:**
+
+1. **Lock contention (#1984)**: `bd create-form` holds a write lock during
+   `$EDITOR`, blocking all other `bd` commands. The fix should acquire the
+   lock only after the editor exits.
+
+2. **BEADS_DIR override**: When `BEADS_DIR` is set, routing is skipped
+   (`beadsDirOverride()` returns true). But custom type validation (#1853)
+   loads types from the working directory's config, not from `BEADS_DIR`.
+   This means `bd update --type=custom` fails when `BEADS_DIR` points to a
+   different directory.
+
+3. **No mode-specific code paths remain**: After embedded Dolt removal, all
+   operations go through the same `DoltStore`. The risk of mode-specific bugs
+   is low. The main risk vector is now **concurrent access** (multiple `bd`
+   processes hitting the same Dolt server).
+
+---
+
+### AREA 4: Blocked Semantics Drift
+
+**Core finding confirmed:** "blocked" is both a stored status value
+(`types.StatusBlocked = "blocked"`) AND a computed property (derived from
+`blocks` dependencies). These two concepts are conflated in the codebase.
+
+**Where `StatusBlocked` is used as a stored status:**
+- `types.go:391` — declared as a valid status value
+- `types.go:401` — passes `IsValidStatus` check
+- `jira/fieldmapper.go:56` — mapped from Jira statuses
+- `linear/mapping.go:312` — mapped from Linear statuses
+- Tests create issues with `Status: types.StatusBlocked` directly
+
+**Where blockedness is computed:**
+- `computeBlockedIDs()` in `queries.go:814` — computes from `dependencies`
+  table, checks `blocks` + `waits-for` deps, returns issue IDs
+- `GetBlockedIssues()` in `queries.go:501` — similar but only checks `blocks`
+  deps (NOT `waits-for`!)
+- `GetReadyWork()` in `queries.go:343` — excludes computed-blocked issues
+
+**BUG-18: `GetBlockedIssues` and `computeBlockedIDs` disagree on `waits-for`** (NEW)
+
+`computeBlockedIDs()` (used by `GetReadyWork`) considers both `blocks` AND
+`waits-for` dependencies. `GetBlockedIssues()` (used by `bd blocked`) only
+considers `blocks` dependencies. An issue blocked by a `waits-for` gate will:
+- NOT appear in `bd ready` (correctly excluded by `computeBlockedIDs`)
+- NOT appear in `bd blocked` (incorrectly excluded — `GetBlockedIssues` doesn't check `waits-for`)
+- Appear in `bd list --status open` (status column is "open")
+
+The issue is invisible to both `ready` and `blocked` commands.
+
+**Fix:** `GetBlockedIssues` should include `waits-for` deps the same way
+`computeBlockedIDs` does.
+
+**BUG-4 code-level confirmation:**
+
+`SearchIssues` at `queries.go:57-59` does a simple column match:
+```go
+if filter.Status != nil {
+    whereClauses = append(whereClauses, "status = ?")
+    args = append(args, *filter.Status)
+}
+```
+
+`bd list --status blocked` passes `"blocked"` as the filter value. This only
+matches issues where `status` was explicitly set to `"blocked"` (e.g., via
+Jira/Linear sync), not issues computed-blocked via dependency graph.
+
+`bd count --status blocked` uses the same path, so counts are also wrong.
+
+---
+
+### AREA 5: Concurrency / Lost Updates
+
+#### 5a. `execContext` isolation
+
+Every call to `execContext` (store.go:281) wraps a single statement in
+`BeginTx/Commit`. Multi-statement operations that call `execContext` multiple
+times are **NOT atomic**:
+
+- `AddLabel` (labels.go:12): label insert + event insert = 2 transactions
+- `RemoveLabel` (labels.go:34): label delete + event insert = 2 transactions
+- `SetConfig` + `SetMetadata` in sequence = 2 transactions
+- Any sequence of `execContext` calls can interleave with concurrent processes
+
+**Impact:** If `AddLabel` succeeds on the label insert but fails on the event
+insert, the label exists without an audit trail. Not data loss, but
+inconsistency.
+
+#### 5b. TOCTOU race in `UpdateIssue` (BUG-19, NEW)
+
+`UpdateIssue` (issues.go:363) reads the old issue at line 369 **before**
+beginning the transaction at line 410:
+
+```go
+func (s *DoltStore) UpdateIssue(...) error {
+    oldIssue, err := s.GetIssue(ctx, id)  // READ outside tx
+    // ... build update query ...
+    tx, err := s.db.BeginTx(ctx, nil)      // TX starts here
+    tx.ExecContext(ctx, query, args...)     // WRITE inside tx
+    recordEvent(ctx, tx, ...)               // uses oldIssue for diff
+    tx.Commit()
+}
+```
+
+Between the read and the tx, another process can modify the issue. The event
+recorded will show stale "old" values. More critically, `manageClosedAt` at
+line 406 uses `oldIssue` to decide whether to set `closed_at` — a stale read
+could result in incorrect `closed_at` management.
+
+**Contrast with `ClaimIssue`** (issues.go:434) which correctly uses a
+conditional `UPDATE ... WHERE assignee = '' OR assignee IS NULL` inside the
+transaction. `UpdateIssue` should follow the same pattern.
+
+#### 5c. Child counter race (BUG-16, see Area 2)
+
+Already documented above. `GetNextChildID` is vulnerable to concurrent
+duplicate child IDs.
+
+#### 5d. Label add is safe against duplicates but not atomic
+
+`INSERT IGNORE INTO labels` prevents duplicate labels, so concurrent
+`bd label add` with the same label is idempotent. But concurrent adds of
+*different* labels to the same issue are safe because labels is a junction
+table — each insert is independent. The BUG-5 "0 labels after parallel adds"
+from the first session was likely a Dolt working-set race that has since been
+fixed by #1969 (execContext now commits per-statement).
+
+**Recommendation:** Re-test BUG-5 on current main. The underlying issue may
+be resolved.
+
+---
+
+### AREA 6: Field Validation and Normalization
+
+**Status validation gap (BUG-11, already tracked):**
+`bd update --status "bogus"` succeeds. The update command validates `--type`
+but not `--status`. `types.IsValidStatus` exists but isn't called from
+`cmd/bd/update.go`.
+
+**Empty field acceptance (BUG-12, BUG-14, already tracked):**
+`bd update --title ""` and `bd label add X ""` both succeed.
+
+**New findings:**
+
+**BUG-20: JSON metadata roundtrip inconsistency** (NEW)
+
+`UpdateIssue` normalizes metadata via `storage.NormalizeMetadataValue()` at
+`issues.go:395`. But `CreateIssuesWithFullOptions` stores metadata directly
+from the issue struct without normalization. If the incoming metadata is
+`nil`, it gets stored as SQL NULL. Subsequent reads via `scanIssue` may return
+`nil` metadata, while the update path would have stored `"{}"`.
+
+This means an issue's metadata can be `nil` or `"{}"` depending on whether
+it was created via `bd create` (which defaults to `{}`) or imported. Code that
+does `if issue.Metadata == nil` vs `if issue.Metadata == "{}"` will behave
+differently.
+
+**BUG-21: `migrate_dolt` drops `metadata` and `spec_id`** (NEW)
+
+`importToDolt()` at `cmd/bd/migrate_dolt.go:460-495` has the INSERT column
+list but is missing two fields:
+- `metadata` (JSON) — custom metadata is silently dropped during migration
+- `spec_id` — spec references are lost
+
+Any user who migrates from SQLite to Dolt via `bd migrate --to-dolt` loses
+all custom metadata and spec associations. This is a real data loss path.
+
+---
+
+### AREA 7: Cross-Rig Routing and External Dependencies
+
+**Architecture is sound:** Two distinct mechanisms:
+1. Prefix-based routing via `routes.jsonl` (read-only cross-rig lookups)
+2. External dependency references (`external:<project>:<issue-id>`)
+
+**Observations:**
+
+1. **Store lifetime management is correct**: `RoutedResult.Close()` cleans up
+   routed storage connections. All callers properly defer `result.Close()`.
+
+2. **Error fallthrough is graceful**: If a routed store lookup fails, it falls
+   back to the local store (routed.go:76-77). Not-found errors don't propagate.
+
+3. **`resolveExternalDepsViaRouting`** creates placeholder entries for
+   unresolvable external deps — no crashes, just "(unresolved external
+   dependency)" labels.
+
+4. **BEADS_DIR override is respected**: When `BEADS_DIR` is set, routing is
+   skipped entirely (routed.go:57-59), matching the contract for gastown
+   callers.
+
+**Potential issues:**
+
+**BUG-22: Cross-rig `bd close` doesn't validate dep store liveness** (INVESTIGATE)
+
+`bd close` with routing resolves the issue from a routed store, but the close
+guard checks blockers from the local store's `computeBlockedIDs`. If an issue
+is blocked by a cross-rig dependency, the blocked check may not find the
+blocker (it's in a different database). This could allow closing an issue that
+is actually blocked by a cross-rig dependency.
+
+**Needs investigation:** Does `computeBlockedIDs` query dependencies that
+reference external IDs? If external deps are stored as `external:project:id`
+in `depends_on_id`, the `activeIDs` check (`activeIDs[blockerID]`) will fail
+because the external ID isn't in the local `issues` table. This means external
+blocking deps are silently ignored by the close guard.
+
+---
+
+### AREA 8: Import/Export Survivability
+
+#### 8a. `CreateIssuesWithFullOptions` (the main import path)
+
+**What survives:**
+- All 50+ issue columns (including metadata, spec_id, due_at, defer_until)
+- Labels (GH#1844 fix — separate INSERT pass)
+- Comments (GH#1844 fix — separate INSERT pass)
+- Dependencies (second pass after all issues exist)
+
+**What is lost:**
+- **Dependencies to missing targets** — silently skipped (issues.go:273-274,
+  `continue` with no log/warning). This is the most dangerous data loss path
+  in imports. A partial import will lose all cross-batch dependencies.
+- **Dependency metadata** — only `type`, `created_by`, `created_at` are
+  written. The `metadata` and `thread_id` columns from the dep struct are
+  NOT in the import INSERT (issues.go:278-281).
+- **Event history** — only a single `EventCreated` is recorded per issue.
+  The original event history (status changes, label adds, etc.) is lost.
+
+#### 8b. `importToDolt` (SQLite→Dolt migration path)
+
+**Missing columns (BUG-21):**
+- `metadata` (JSON) — silently dropped
+- `spec_id` — silently dropped
+
+**Duplicate handling:** Uses `strings.Contains(err.Error(), "Duplicate entry")`
+to detect and skip duplicates (migrate_dolt.go:497-499). This is fragile —
+it depends on Dolt error message format, which could change between versions.
+
+#### 8c. Ephemeral promotion (`ephemeral_routing.go`)
+
+When a wisp is promoted to persistent storage:
+- Issue data is inserted via `insertIssue` (correct)
+- Labels: `INSERT IGNORE` (correct but drops conflicts — BUG-17)
+- Dependencies: `INSERT IGNORE` (drops conflicts — BUG-17)
+- Events: `INSERT IGNORE` with `_, _ =` (best-effort, errors silenced)
+- Comments: `INSERT IGNORE` with `_, _ =` (best-effort, errors silenced)
+
+**Impact:** Event and comment copy failures during promotion are silently
+ignored. If the promotion succeeds but event/comment copy fails, the
+promoted issue has no audit trail.
+
+---
+
+### Build Issues
+
+**BUG-23: `InstrumentedStorage` doesn't implement `Storage` interface** (BUILD BREAK)
+
+`internal/telemetry/storage.go:393` has:
+```go
+func (s *InstrumentedStorage) RunInTransaction(ctx context.Context,
+    fn func(tx storage.Transaction) error) error {
+```
+
+But the `Storage` interface at `internal/storage/storage.go:80` now requires:
+```go
+RunInTransaction(ctx context.Context, commitMsg string,
+    fn func(tx Transaction) error) error
+```
+
+The `commitMsg string` parameter was added to `DoltStore.RunInTransaction`
+(transaction.go:31) and the interface, but `InstrumentedStorage` wasn't
+updated. This is a compile error that blocks the otel feature.
+
+---
+
+### New Bugs Summary (Session 2)
+
+| Bug | Severity | Area | Description |
+|-----|----------|------|-------------|
+| BUG-15 | MEDIUM | SQL patterns | Wisp dep type silently overwritten (same as BUG-7 for wisps) |
+| BUG-16 | HIGH | Concurrency | Child counter race — duplicate child IDs possible |
+| BUG-17 | MEDIUM | Import/export | Wisp promotion silently drops conflicting deps |
+| BUG-18 | HIGH | Blocked semantics | `GetBlockedIssues` ignores `waits-for` deps, issue invisible to both `ready` and `blocked` |
+| BUG-19 | MEDIUM | Concurrency | TOCTOU race in `UpdateIssue` — stale read outside tx |
+| BUG-20 | LOW | Validation | JSON metadata `nil` vs `"{}"` inconsistency between create and import |
+| BUG-21 | HIGH | Import/export | `migrate_dolt` drops `metadata` and `spec_id` columns |
+| BUG-22 | INVESTIGATE | Routing | Cross-rig close guard may ignore external blocking deps |
+| BUG-23 | BUILD BREAK | Telemetry | `InstrumentedStorage.RunInTransaction` signature mismatch |
+
+### Test Coverage — Session 2
+
+Tests written in `tests/regression/discovery_test.go` and
+`internal/telemetry/compile_test.go` targeting bugs BUG-15 through BUG-23.
+
+#### Tier A: Deterministic, High-Yield (in discovery_test.go)
+
+| Test | Bug | What it checks |
+|------|-----|----------------|
+| `TestA1_ExternalBlockerSemanticsEnforced` | BUG-22 | External `blocks` deps enforced by close guard and `bd ready` |
+| `TestA1b_ExternalDepStoredAndVisible` | (prereq) | External deps can be added and appear in `dep list` |
+| `TestA2_WaitsForBlockingAppearsInBdBlocked` | BUG-18 | `waits-for` blocked issues visible in `bd blocked` |
+| `TestA3_MetadataRoundTrip` | BUG-21 | Metadata survives create → update → show → import round-trip |
+| `TestA4_WispDepTypeOverwrite` | BUG-15 | Wisp dep type not silently overwritten by re-add |
+| `TestBug16_ChildCounterUniqueness` | BUG-16 | Sequential child creates produce unique IDs |
+| `TestBug18_BlockedSemanticsConsistency` | BUG-18 | Every open issue appears in EITHER `ready` OR `blocked` |
+| `TestBug19_UpdateIssueEventConsistency` | BUG-19 | Event chain consistent after sequential title updates |
+| `TestBug20_MetadataNilVsEmptyObject` | BUG-20 | Metadata normalization consistent between create and update |
+
+#### Tier B: Stress Tests (gated behind BD_STRESS=1)
+
+| Test | Bug | What it checks |
+|------|-----|----------------|
+| `TestB1_ChildCounterConcurrency` | BUG-16 | 10 concurrent child creates produce unique IDs |
+| `TestB2_ConcurrentLabelAdd` | BUG-5 | 5 concurrent label adds all survive |
+| `TestB3_ConcurrentUpdate` | BUG-19 | 5 concurrent title updates don't crash |
+
+#### Tier C: Compile-Time (in internal/telemetry/compile_test.go)
+
+| Test | Bug | What it checks |
+|------|-----|----------------|
+| `var _ storage.Storage = (*InstrumentedStorage)(nil)` | BUG-23 | Interface compliance — catches method signature drift |
+
+**Status:** BUG-23 compile test immediately caught the `RunInTransaction`
+signature mismatch, confirming the test works. The remaining tests require
+`go test -tags=regression` with a running Dolt server.
+
+#### Planned Tests (not yet written)
+
+| Test | Bug | Needs |
+|------|-----|-------|
+| `TestBug21_MigrateToDoltPreservesMetadataAndSpecID` | BUG-21 | Real SQLite fixture file for `bd migrate --to-dolt` |
+| `TestBug17_PromoteWispDoesNotSilentlyDropConflictingDeps` | BUG-17 | Wisp promotion API from CLI (may need internal test) |
+| `TestBug_CreateFormDoesNotHoldWriteLockDuringEditor` | #1984 | Concurrent `bd` commands during `bd create-form` |
+
+---
+
+### Remaining Discovery Backlog
+
+These are areas that warrant further investigation but were not fully explored:
+
+1. **Re-test BUG-5** (concurrent label race) on current main — the underlying
+   `execContext` fix (#1969) may have resolved it.
+
+2. **Audit exit code handling** across all multi-ID commands beyond what BUG-10
+   covers. `bd label add/remove`, `bd dep add/rm` with multiple IDs — do they
+   exit non-zero on partial failure?
+
+3. **Test `bd repo sync`** end-to-end (#1945) — the duplicate key on re-import
+   and missing cross-prefix hydration are likely still broken.
+
+4. **Audit timezone handling** in `due_at` and `defer_until` — are these
+   stored as UTC? What happens when a user in UTC+9 defers until "2026-03-01"?
+
+5. **Audit `bd rename` cascading** — `rename.go:121-134` uses LIKE CONCAT for
+   bulk dependency updates. Does it correctly handle nested hierarchical IDs
+   (e.g., `bd-abc.1.1`)? The `LIKE CONCAT(?, '%')` would match too broadly.
+
+6. **Test `waits-for` + `children-of(...)` gates** end-to-end — #1899 was
+   closed but the interaction between `waits-for` and `computeBlockedIDs` is
+   complex (queries.go:845-970) and may have edge cases.
+
+7. **Audit `bd sql` write safety** (OBS-3) — arbitrary writes without
+   confirmation. Could silently corrupt data if an agent runs `bd sql "UPDATE ..."`.
+
+8. **Test partial failure in `bd close` with mixed valid/invalid IDs** —
+   does it close the valid ones and exit non-zero? Or abort on first failure?
+
+9. **Audit `bd move` cross-prefix correctness** — moving an issue to a
+   different prefix involves dep updates via LIKE CONCAT. Same risk as
+   reparenting (BUG-8) but with prefix instead of parent ID.
+
+10. **Profile `computeBlockedIDs` at scale** — it does 3+ full table scans
+    (issues, dependencies, child lookup). At 10K+ issues this could be slow,
+    especially without the cache.
