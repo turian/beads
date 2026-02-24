@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/hooks"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/timeparsing"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -42,6 +43,20 @@ create, update, show, or close operation).`,
 
 		if cmd.Flags().Changed("status") {
 			status, _ := cmd.Flags().GetString("status")
+			var customStatuses []string
+			if store != nil {
+				cs, err := store.GetCustomStatuses(rootCtx)
+				if err != nil {
+					if !jsonOutput {
+						fmt.Fprintf(os.Stderr, "%s Failed to get custom statuses: %v\n", ui.RenderWarn("!"), err)
+					}
+				} else {
+					customStatuses = cs
+				}
+			}
+			if !types.Status(status).IsValidWithCustom(customStatuses) {
+				FatalErrorRespectJSON("invalid status %q (built-in: open, in_progress, blocked, deferred, closed, pinned, hooked; or configure custom statuses via 'bd config set status.custom')", status)
+			}
 			updates["status"] = status
 
 			// If status is being set to closed, include session if provided
@@ -65,6 +80,10 @@ create, update, show, or close operation).`,
 		}
 		if cmd.Flags().Changed("title") {
 			title, _ := cmd.Flags().GetString("title")
+			title = strings.TrimSpace(title)
+			if title == "" {
+				FatalErrorRespectJSON("title cannot be empty")
+			}
 			updates["title"] = title
 		}
 		if cmd.Flags().Changed("assignee") {
@@ -234,6 +253,17 @@ create, update, show, or close operation).`,
 			updates["metadata"] = json.RawMessage(metadataJSON)
 		}
 
+		// Incremental metadata edits (GH#1406)
+		setMetadataFlags, _ := cmd.Flags().GetStringArray("set-metadata")
+		unsetMetadataFlags, _ := cmd.Flags().GetStringArray("unset-metadata")
+		if (len(setMetadataFlags) > 0 || len(unsetMetadataFlags) > 0) && cmd.Flags().Changed("metadata") {
+			FatalErrorRespectJSON("cannot combine --metadata with --set-metadata or --unset-metadata")
+		}
+		if len(setMetadataFlags) > 0 || len(unsetMetadataFlags) > 0 {
+			updates["_set_metadata"] = setMetadataFlags
+			updates["_unset_metadata"] = unsetMetadataFlags
+		}
+
 		// Get claim flag
 		claimFlag, _ := cmd.Flags().GetBool("claim")
 
@@ -284,9 +314,20 @@ create, update, show, or close operation).`,
 			// Apply regular field updates if any
 			regularUpdates := make(map[string]interface{})
 			for k, v := range updates {
-				if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" && k != "append_notes" {
+				if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" && k != "append_notes" &&
+					k != "_set_metadata" && k != "_unset_metadata" {
 					regularUpdates[k] = v
 				}
+			}
+
+			// Handle incremental metadata edits (GH#1406)
+			if setMeta, ok := updates["_set_metadata"].([]string); ok {
+				unsetMeta, _ := updates["_unset_metadata"].([]string)
+				merged, err := applyMetadataEdits(issue.Metadata, setMeta, unsetMeta)
+				if err != nil {
+					FatalErrorRespectJSON("metadata edit failed for %s: %v", id, err)
+				}
+				regularUpdates["metadata"] = merged
 			}
 			// Handle append_notes: combine existing notes with new content
 			if appendNotes, ok := updates["append_notes"].(string); ok {
@@ -401,7 +442,78 @@ create, update, show, or close operation).`,
 		if jsonOutput && len(updatedIssues) > 0 {
 			outputJSON(updatedIssues)
 		}
+
+		// Exit non-zero if no issues were actually updated (claim failures
+		// and other soft errors should surface as non-zero exit codes for scripting)
+		if len(args) > 0 && firstUpdatedID == "" {
+			os.Exit(1)
+		}
 	},
+}
+
+// applyMetadataEdits applies --set-metadata and --unset-metadata edits to existing metadata.
+// Returns the merged JSON as json.RawMessage.
+func applyMetadataEdits(existing json.RawMessage, setFlags, unsetFlags []string) (json.RawMessage, error) {
+	// Parse existing metadata (or start with empty object)
+	data := make(map[string]json.RawMessage)
+	if len(existing) > 0 {
+		trimmed := strings.TrimSpace(string(existing))
+		if trimmed != "" && trimmed != "null" {
+			if err := json.Unmarshal(existing, &data); err != nil {
+				return nil, fmt.Errorf("existing metadata is not a JSON object: %w", err)
+			}
+		}
+	}
+
+	// Apply --set-metadata key=value pairs
+	for _, kv := range setFlags {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || k == "" {
+			return nil, fmt.Errorf("invalid --set-metadata: expected key=value, got %q", kv)
+		}
+		if err := storage.ValidateMetadataKey(k); err != nil {
+			return nil, err
+		}
+		// Store as JSON value: try to preserve type (number, bool, null)
+		data[k] = toJSONValue(v)
+	}
+
+	// Apply --unset-metadata keys
+	for _, k := range unsetFlags {
+		if err := storage.ValidateMetadataKey(k); err != nil {
+			return nil, err
+		}
+		delete(data, k)
+	}
+
+	result, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+	return json.RawMessage(result), nil
+}
+
+// toJSONValue converts a string value to its most appropriate JSON representation.
+// Recognizes numbers, booleans, and null; everything else becomes a JSON string.
+func toJSONValue(s string) json.RawMessage {
+	// Check for null
+	if s == "null" {
+		return json.RawMessage("null")
+	}
+	// Check for booleans
+	if s == "true" || s == "false" {
+		return json.RawMessage(s)
+	}
+	// Check for numbers (integer or float)
+	if _, err := fmt.Sscanf(s, "%f", new(float64)); err == nil {
+		// Verify it round-trips cleanly (not NaN, Inf, etc.)
+		if json.Valid([]byte(s)) {
+			return json.RawMessage(s)
+		}
+	}
+	// Default to JSON string
+	b, _ := json.Marshal(s)
+	return json.RawMessage(b)
 }
 
 func init() {
@@ -438,6 +550,9 @@ func init() {
 	updateCmd.Flags().Bool("persistent", false, "Mark issue as persistent (promote wisp to regular issue)")
 	// Metadata flag (GH#1413)
 	updateCmd.Flags().String("metadata", "", "Set custom metadata (JSON string or @file.json to read from file)")
+	// Incremental metadata edits (GH#1406)
+	updateCmd.Flags().StringArray("set-metadata", nil, "Set metadata key=value (repeatable, e.g., --set-metadata team=platform)")
+	updateCmd.Flags().StringArray("unset-metadata", nil, "Remove metadata key (repeatable, e.g., --unset-metadata team)")
 	updateCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(updateCmd)
 }

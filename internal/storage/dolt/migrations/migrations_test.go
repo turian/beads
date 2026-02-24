@@ -3,6 +3,7 @@ package migrations
 import (
 	"database/sql"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,10 +28,23 @@ func openTestDolt(t *testing.T) *sql.DB {
 		t.Fatalf("failed to create db dir: %v", err)
 	}
 
+	// Configure dolt identity in the temp root (required for dolt init)
+	doltEnv := append(os.Environ(), "DOLT_ROOT_PATH="+tmpDir)
+	for _, cfg := range []struct{ key, val string }{
+		{"user.name", "Test User"},
+		{"user.email", "test@example.com"},
+	} {
+		cfgCmd := exec.Command("dolt", "config", "--global", "--add", cfg.key, cfg.val)
+		cfgCmd.Env = doltEnv
+		if out, err := cfgCmd.CombinedOutput(); err != nil {
+			t.Fatalf("dolt config %s failed: %v\n%s", cfg.key, err, out)
+		}
+	}
+
 	// Initialize dolt repo
 	initCmd := exec.Command("dolt", "init")
 	initCmd.Dir = dbPath
-	initCmd.Env = append(os.Environ(), "DOLT_ROOT_PATH="+tmpDir)
+	initCmd.Env = doltEnv
 	if out, err := initCmd.CombinedOutput(); err != nil {
 		t.Fatalf("dolt init failed: %v\n%s", err, out)
 	}
@@ -38,23 +52,26 @@ func openTestDolt(t *testing.T) *sql.DB {
 	// Create beads database
 	sqlCmd := exec.Command("dolt", "sql", "-q", "CREATE DATABASE IF NOT EXISTS beads")
 	sqlCmd.Dir = dbPath
-	sqlCmd.Env = append(os.Environ(), "DOLT_ROOT_PATH="+tmpDir)
+	sqlCmd.Env = doltEnv
 	if out, err := sqlCmd.CombinedOutput(); err != nil {
 		t.Fatalf("create database failed: %v\n%s", err, out)
 	}
 
-	// Find a free port
-	port := 13307 + os.Getpid()%1000
+	// Find a free port by binding and releasing
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
 
 	// Start dolt sql-server
 	serverCmd := exec.Command("dolt", "sql-server",
 		"--host", "127.0.0.1",
 		"--port", fmt.Sprintf("%d", port),
-		"--user", "root",
-		"--no-auto-commit",
 	)
 	serverCmd.Dir = dbPath
-	serverCmd.Env = append(os.Environ(), "DOLT_ROOT_PATH="+tmpDir)
+	serverCmd.Env = doltEnv
 	if err := serverCmd.Start(); err != nil {
 		t.Fatalf("failed to start dolt sql-server: %v", err)
 	}
@@ -64,24 +81,26 @@ func openTestDolt(t *testing.T) *sql.DB {
 	})
 
 	// Wait for server to be ready
-	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%d)/beads", port)
+	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%d)/beads?allowCleartextPasswords=true&allowNativePasswords=true", port)
 	var db *sql.DB
-	var err error
-	for i := 0; i < 30; i++ {
-		db, err = sql.Open("mysql", dsn)
-		if err == nil {
-			if pingErr := db.Ping(); pingErr == nil {
-				break
-			}
-			_ = db.Close()
-		}
+	var lastPingErr error
+	for i := 0; i < 50; i++ {
 		time.Sleep(200 * time.Millisecond)
+		db, err = sql.Open("mysql", dsn)
+		if err != nil {
+			continue
+		}
+		if pingErr := db.Ping(); pingErr == nil {
+			lastPingErr = nil
+			break
+		} else {
+			lastPingErr = pingErr
+		}
+		_ = db.Close()
+		db = nil
 	}
-	if err != nil {
-		t.Fatalf("failed to connect to dolt server: %v", err)
-	}
-	if pingErr := db.Ping(); pingErr != nil {
-		t.Fatalf("dolt server not ready after retries: %v", pingErr)
+	if db == nil {
+		t.Fatalf("dolt server not ready after retries: %v", lastPingErr)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -289,5 +308,52 @@ func TestMigrateWispsTable(t *testing.T) {
 	}
 	if title != "Test Wisp" {
 		t.Fatalf("expected title 'Test Wisp', got %q", title)
+	}
+}
+
+func TestMigrateIssueCounterTable(t *testing.T) {
+	db := openTestDolt(t)
+
+	// Verify issue_counter table does not exist yet
+	exists, err := tableExists(db, "issue_counter")
+	if err != nil {
+		t.Fatalf("failed to check table: %v", err)
+	}
+	if exists {
+		t.Fatal("issue_counter should not exist yet")
+	}
+
+	// Run migration
+	if err := MigrateIssueCounterTable(db); err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+
+	// Verify issue_counter table now exists
+	exists, err = tableExists(db, "issue_counter")
+	if err != nil {
+		t.Fatalf("failed to check table after migration: %v", err)
+	}
+	if !exists {
+		t.Fatal("issue_counter should exist after migration")
+	}
+
+	// Run migration again (idempotent)
+	if err := MigrateIssueCounterTable(db); err != nil {
+		t.Fatalf("re-running migration should be idempotent: %v", err)
+	}
+
+	// Verify we can INSERT and query from issue_counter
+	_, err = db.Exec("INSERT INTO issue_counter (prefix, last_id) VALUES ('bd', 5)")
+	if err != nil {
+		t.Fatalf("failed to insert into issue_counter: %v", err)
+	}
+
+	var lastID int
+	err = db.QueryRow("SELECT last_id FROM issue_counter WHERE prefix = 'bd'").Scan(&lastID)
+	if err != nil {
+		t.Fatalf("failed to query issue_counter: %v", err)
+	}
+	if lastID != 5 {
+		t.Errorf("expected last_id 5, got %d", lastID)
 	}
 }

@@ -1,8 +1,7 @@
 // Package dolt implements the storage interface using Dolt (versioned MySQL-compatible database).
 //
 // Dolt provides native version control for SQL data with cell-level merge, history queries,
-// and federation via Dolt remotes. This backend eliminates the need for JSONL sync layers
-// by making the database itself version-controlled.
+// and federation via Dolt remotes. The database itself is version-controlled.
 //
 // Dolt capabilities:
 //   - Native version control (commit, push, pull, branch, merge)
@@ -21,6 +20,7 @@ import (
 	"hash/fnv"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +30,13 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	// Import MySQL driver for server mode connections
 	_ "github.com/go-sql-driver/mysql"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
+	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 )
@@ -57,6 +63,10 @@ type DoltStore struct {
 	blockedIDsCached   bool // true once blockedIDsCache has been populated
 	cacheMu            sync.Mutex
 
+	// OTel span attribute cache (avoids per-call allocation)
+	spanAttrsOnce  sync.Once
+	spanAttrsCache []attribute.KeyValue
+
 	// Version control config
 	committerName  string
 	committerEmail string
@@ -68,12 +78,12 @@ type DoltStore struct {
 
 // Config holds Dolt database configuration
 type Config struct {
-	Path           string        // Path to Dolt database directory
-	CommitterName  string        // Git-style committer name
-	CommitterEmail string        // Git-style committer email
-	Remote         string        // Default remote name (e.g., "origin")
-	Database       string        // Database name within Dolt (default: "beads")
-	ReadOnly       bool          // Open in read-only mode (skip schema init)
+	Path           string // Path to Dolt database directory
+	CommitterName  string // Git-style committer name
+	CommitterEmail string // Git-style committer email
+	Remote         string // Default remote name (e.g., "origin")
+	Database       string // Database name within Dolt (default: "beads")
+	ReadOnly       bool   // Open in read-only mode (skip schema init)
 
 	// Server connection options
 	ServerHost     string // Server host (default: 127.0.0.1)
@@ -87,8 +97,10 @@ type Config struct {
 	RemoteUser     string // Hosted Dolt remote user (set via DOLT_REMOTE_USER env var)
 	RemotePassword string // Hosted Dolt remote password (set via DOLT_REMOTE_PASSWORD env var)
 
-	// Watchdog options
-	DisableWatchdog bool // Disable server health monitoring (default: enabled in server mode)
+	// AutoStart enables transparent server auto-start when connection fails.
+	// When true and the host is localhost, bd will start a dolt sql-server
+	// automatically if one isn't running. Disabled under Gas Town (GT_ROOT set).
+	AutoStart bool
 }
 
 // Retry configuration for transient connection errors (stale pool connections,
@@ -190,8 +202,10 @@ func wrapLockError(err error) error {
 
 // withRetry executes an operation with retry for transient errors.
 func (s *DoltStore) withRetry(ctx context.Context, op func() error) error {
+	attempts := 0
 	bo := newServerRetryBackoff()
-	return backoff.Retry(func() error {
+	err := backoff.Retry(func() error {
+		attempts++
 		err := op()
 		if err != nil && isRetryableError(err) {
 			return err // Retryable - backoff will retry
@@ -201,6 +215,65 @@ func (s *DoltStore) withRetry(ctx context.Context, op func() error) error {
 		}
 		return nil
 	}, backoff.WithContext(bo, ctx))
+	if attempts > 1 {
+		doltMetrics.retryCount.Add(ctx, int64(attempts-1))
+	}
+	return err
+}
+
+// doltTracer is the OTel tracer for SQL-level spans.
+// It uses the global provider, which is a no-op until telemetry.Init() is called.
+var doltTracer = otel.Tracer("github.com/steveyegge/beads/storage/dolt")
+
+// doltMetrics holds OTel metric instruments for the dolt storage backend.
+// Instruments are registered against the global delegating provider at init time,
+// so they automatically forward to the real provider once telemetry.Init() runs.
+var doltMetrics struct {
+	retryCount metric.Int64Counter
+	lockWaitMs metric.Float64Histogram
+}
+
+func init() {
+	m := otel.Meter("github.com/steveyegge/beads/storage/dolt")
+	doltMetrics.retryCount, _ = m.Int64Counter("bd.db.retry_count",
+		metric.WithDescription("SQL operations retried due to server-mode transient errors"),
+		metric.WithUnit("{retry}"),
+	)
+	doltMetrics.lockWaitMs, _ = m.Float64Histogram("bd.db.lock_wait_ms",
+		metric.WithDescription("Time spent waiting to acquire the dolt access lock"),
+		metric.WithUnit("ms"),
+	)
+}
+
+// doltSpanAttrs returns the fixed attributes shared by all SQL spans.
+// Cached to avoid allocating on every call (hot path when telemetry is disabled
+// still flows through no-op tracers).
+func (s *DoltStore) doltSpanAttrs() []attribute.KeyValue {
+	s.spanAttrsOnce.Do(func() {
+		s.spanAttrsCache = []attribute.KeyValue{
+			attribute.String("db.system", "dolt"),
+			attribute.Bool("db.readonly", s.readOnly),
+			attribute.Bool("db.server_mode", true), // always server mode after embedded removal
+		}
+	})
+	return s.spanAttrsCache
+}
+
+// spanSQL truncates a SQL string to keep spans readable.
+func spanSQL(q string) string {
+	if len(q) > 300 {
+		return q[:300] + "…"
+	}
+	return q
+}
+
+// endSpan records an error (if any) and ends the span.
+func endSpan(span trace.Span, err error) {
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.End()
 }
 
 // execContext wraps a write statement in an explicit BEGIN/COMMIT to ensure
@@ -209,6 +282,13 @@ func (s *DoltStore) withRetry(ctx context.Context, op func() error) error {
 // uncommitted implicit transaction that Dolt rolls back on connection close,
 // causing silent data loss for callers that do not use db.BeginTx themselves.
 func (s *DoltStore) execContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	ctx, span := doltTracer.Start(ctx, "dolt.exec",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(append(s.doltSpanAttrs(),
+			attribute.String("db.operation", "exec"),
+			attribute.String("db.statement", spanSQL(query)),
+		)...),
+	)
 	var result sql.Result
 	err := s.withRetry(ctx, func() error {
 		tx, txErr := s.db.BeginTx(ctx, nil)
@@ -223,27 +303,58 @@ func (s *DoltStore) execContext(ctx context.Context, query string, args ...any) 
 		}
 		return tx.Commit()
 	})
-	return result, wrapLockError(err)
+	finalErr := wrapLockError(err)
+	endSpan(span, finalErr)
+	return result, finalErr
+}
+
+// DB returns the underlying sql.DB connection for direct queries.
+// Use sparingly — prefer the store's typed methods for normal operations.
+func (s *DoltStore) DB() *sql.DB {
+	return s.db
 }
 
 // queryContext wraps s.db.QueryContext with retry for transient errors.
 func (s *DoltStore) queryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	ctx, span := doltTracer.Start(ctx, "dolt.query",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(append(s.doltSpanAttrs(),
+			attribute.String("db.operation", "query"),
+			attribute.String("db.statement", spanSQL(query)),
+		)...),
+	)
 	var rows *sql.Rows
 	err := s.withRetry(ctx, func() error {
+		// Close any Rows from a previous failed attempt to avoid leaking connections.
+		if rows != nil {
+			_ = rows.Close()
+			rows = nil
+		}
 		var queryErr error
 		rows, queryErr = s.db.QueryContext(ctx, query, args...)
 		return queryErr
 	})
-	return rows, wrapLockError(err)
+	finalErr := wrapLockError(err)
+	endSpan(span, finalErr)
+	return rows, finalErr
 }
 
 // queryRowContext wraps s.db.QueryRowContext with retry for transient errors.
 // The scan function receives the *sql.Row and should call .Scan() on it.
 func (s *DoltStore) queryRowContext(ctx context.Context, scan func(*sql.Row) error, query string, args ...any) error {
-	return wrapLockError(s.withRetry(ctx, func() error {
+	ctx, span := doltTracer.Start(ctx, "dolt.query_row",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(append(s.doltSpanAttrs(),
+			attribute.String("db.operation", "query_row"),
+			attribute.String("db.statement", spanSQL(query)),
+		)...),
+	)
+	finalErr := wrapLockError(s.withRetry(ctx, func() error {
 		row := s.db.QueryRowContext(ctx, query, args...)
 		return scan(row)
 	}))
+	endSpan(span, finalErr)
+	return finalErr
 }
 
 // applyConfigDefaults fills in default values for unset Config fields.
@@ -280,9 +391,20 @@ func applyConfigDefaults(cfg *Config) {
 	if cfg.ServerHost == "" {
 		cfg.ServerHost = "127.0.0.1"
 	}
-	if cfg.ServerPort == 0 {
-		// Check environment variable for port override (used by test harness to
-		// redirect all connections to a dedicated test server on a dynamic port).
+	// In test mode, BEADS_DOLT_PORT ALWAYS overrides cfg.ServerPort — even if
+	// already set by NewFromConfigWithOptions reading metadata.json. Without this,
+	// tests that go through the config path silently connect to the prod server.
+	if os.Getenv("BEADS_TEST_MODE") == "1" {
+		if envPort := os.Getenv("BEADS_DOLT_PORT"); envPort != "" {
+			if p, err := strconv.Atoi(envPort); err == nil && p > 0 {
+				cfg.ServerPort = p
+			}
+		} else if cfg.ServerPort == 0 || cfg.ServerPort == DefaultSQLPort {
+			// No test server port set — use sentinel port 1 so connection
+			// fails immediately instead of silently hitting prod.
+			cfg.ServerPort = 1
+		}
+	} else if cfg.ServerPort == 0 {
 		if envPort := os.Getenv("BEADS_DOLT_PORT"); envPort != "" {
 			if p, err := strconv.Atoi(envPort); err == nil && p > 0 {
 				cfg.ServerPort = p
@@ -318,6 +440,17 @@ func New(ctx context.Context, cfg *Config) (*DoltStore, error) {
 
 	applyConfigDefaults(cfg)
 
+	// Hard guard: tests must NEVER connect to the production Dolt server.
+	// If BEADS_TEST_MODE=1 and we're about to hit the default prod port,
+	// something upstream forgot to set BEADS_DOLT_PORT. Panic immediately
+	// so the test fails loudly instead of silently polluting prod.
+	if os.Getenv("BEADS_TEST_MODE") == "1" && cfg.ServerPort == DefaultSQLPort {
+		panic(fmt.Sprintf(
+			"BEADS_TEST_MODE=1 but connecting to prod port %d — set BEADS_DOLT_PORT or use test helpers (database=%q, path=%q)",
+			DefaultSQLPort, cfg.Database, cfg.Path,
+		))
+	}
+
 	return newServerMode(ctx, cfg)
 }
 
@@ -330,8 +463,31 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 	addr := net.JoinHostPort(cfg.ServerHost, fmt.Sprintf("%d", cfg.ServerPort))
 	conn, dialErr := net.DialTimeout("tcp", addr, 500*time.Millisecond)
 	if dialErr != nil {
-		return nil, fmt.Errorf("Dolt server unreachable at %s: %w\n\nThe Dolt server may not be running. Try:\n  gt dolt start    # If using Gas Town\n  bd dolt start    # If using Beads directly",
-			addr, dialErr)
+		// Auto-start: if enabled and connecting to localhost, start a server
+		if cfg.AutoStart && isLocalHost(cfg.ServerHost) && cfg.Path != "" {
+			beadsDir := filepath.Dir(cfg.Path) // cfg.Path is .beads/dolt → parent is .beads/
+			port, startErr := doltserver.EnsureRunning(beadsDir)
+			if startErr != nil {
+				return nil, fmt.Errorf("Dolt server unreachable at %s and auto-start failed: %w\n\n"+
+					"To start manually: bd dolt start\n"+
+					"To disable auto-start: set dolt.auto-start: false in .beads/config.yaml",
+					addr, startErr)
+			}
+			// Update port in case EnsureRunning used a derived port
+			if port != cfg.ServerPort {
+				cfg.ServerPort = port
+				addr = net.JoinHostPort(cfg.ServerHost, fmt.Sprintf("%d", cfg.ServerPort))
+			}
+			// Retry connection with longer timeout (server just started)
+			conn, dialErr = net.DialTimeout("tcp", addr, 2*time.Second)
+			if dialErr != nil {
+				return nil, fmt.Errorf("Dolt server auto-started but still unreachable at %s: %w\n\n"+
+					"Check logs: %s", addr, dialErr, doltserver.LogPath(beadsDir))
+			}
+		} else {
+			return nil, fmt.Errorf("Dolt server unreachable at %s: %w\n\nThe Dolt server may not be running. Try:\n  bd dolt start    # Start a local server\n  gt dolt start    # If using Gas Town",
+				addr, dialErr)
+		}
 	}
 	_ = conn.Close()
 
@@ -349,6 +505,7 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 
 	store := &DoltStore{
 		db:             db,
+		dbPath:         cfg.Path,
 		connStr:        connStr,
 		committerName:  cfg.CommitterName,
 		committerEmail: cfg.CommitterEmail,
@@ -381,41 +538,20 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		}
 	}
 
-	// Branch-per-polecat: if BD_BRANCH is set, checkout polecat-specific branch.
-	// Each polecat writes to its own Dolt branch to eliminate optimistic lock
-	// contention between concurrent writers. Merges happen at gt done time.
-	if bdBranch := os.Getenv("BD_BRANCH"); bdBranch != "" {
-		// Force single connection to ensure branch checkout applies to all operations.
-		// This is safe because each polecat is a separate bd process.
-		db.SetMaxOpenConns(1)
-		db.SetMaxIdleConns(1)
-		if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", bdBranch); err != nil {
-			// Branch doesn't exist — auto-create from current branch, then checkout.
-			// This makes polecats self-healing: they create their own branches
-			// if Gas Town hasn't pre-created them (race condition, cleanup, etc.).
-			if _, createErr := db.ExecContext(ctx, "CALL DOLT_BRANCH(?)", bdBranch); createErr != nil {
-				_ = store.Close()
-				return nil, fmt.Errorf("failed to create Dolt branch %s: %w (checkout error: %v)", bdBranch, createErr, err)
-			}
-			if _, coErr := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", bdBranch); coErr != nil {
-				_ = store.Close()
-				return nil, fmt.Errorf("failed to checkout Dolt branch %s after creation: %w", bdBranch, coErr)
-			}
-		}
-		store.branch = bdBranch
-
-		// Re-run schema init on the working branch. Untracked tables
-		// (wisps, wisp_*) exist only in the working set and are lost on
-		// branch checkout. Re-init is idempotent and recreates them.
-		if !cfg.ReadOnly {
-			if err := store.initSchema(ctx); err != nil {
-				_ = store.Close()
-				return nil, fmt.Errorf("failed to initialize schema on branch %s: %w", bdBranch, err)
-			}
-		}
-	}
+	// All writers operate on main — transaction isolation via RunInTransaction
+	// replaces the former branch-per-polecat approach (BD_BRANCH).
+	store.branch = "main"
 
 	return store, nil
+}
+
+// isLocalHost returns true if the host refers to the local machine.
+func isLocalHost(host string) bool {
+	switch host {
+	case "", "127.0.0.1", "localhost", "::1", "[::1]":
+		return true
+	}
+	return false
 }
 
 // buildServerDSN constructs a MySQL DSN for connecting to a Dolt server.
@@ -481,7 +617,7 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, er
 			_ = db.Close()
 			// Check for connection refused - server likely not running
 			if strings.Contains(errLower, "connection refused") || strings.Contains(errLower, "connect: connection refused") {
-				return nil, "", fmt.Errorf("failed to connect to Dolt server at %s:%d: %w\n\nThe Dolt server may not be running. Try:\n  gt dolt start    # If using Gas Town\n  bd dolt start # If using Beads directly",
+				return nil, "", fmt.Errorf("failed to connect to Dolt server at %s:%d: %w\n\nThe Dolt server may not be running. Try:\n  bd dolt start    # Start a local server\n  gt dolt start    # If using Gas Town",
 					cfg.ServerHost, cfg.ServerPort, err)
 			}
 			return nil, "", fmt.Errorf("failed to create database: %w", err)
@@ -711,11 +847,18 @@ func (s *DoltStore) commitAuthorString() string {
 }
 
 // Commit creates a Dolt commit with the given message
-func (s *DoltStore) Commit(ctx context.Context, message string) error {
+func (s *DoltStore) Commit(ctx context.Context, message string) (retErr error) {
+	ctx, span := doltTracer.Start(ctx, "dolt.commit",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(s.doltSpanAttrs()...),
+	)
+	defer func() { endSpan(span, retErr) }()
 	// NOTE: In SQL procedure mode, Dolt defaults author to the authenticated SQL user
 	// (e.g. root@localhost). Always pass an explicit author for deterministic history.
-	_, err := s.db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)", message, s.commitAuthorString())
-	if err != nil {
+	if _, err := s.db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)", message, s.commitAuthorString()); err != nil {
+		if isDoltNothingToCommit(err) {
+			return nil
+		}
 		return fmt.Errorf("failed to commit: %w", err)
 	}
 	return nil
@@ -835,7 +978,15 @@ func (s *DoltStore) buildBatchCommitMessage(ctx context.Context, actor string) s
 // Push pushes commits to the remote.
 // When remote credentials are configured (for Hosted Dolt), sets DOLT_REMOTE_PASSWORD
 // env var and passes --user flag to authenticate.
-func (s *DoltStore) Push(ctx context.Context) error {
+func (s *DoltStore) Push(ctx context.Context) (retErr error) {
+	ctx, span := doltTracer.Start(ctx, "dolt.push",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(append(s.doltSpanAttrs(),
+			attribute.String("dolt.remote", s.remote),
+			attribute.String("dolt.branch", s.branch),
+		)...),
+	)
+	defer func() { endSpan(span, retErr) }()
 	if s.remoteUser != "" {
 		federationEnvMutex.Lock()
 		cleanup := setFederationCredentials(s.remoteUser, s.remotePassword)
@@ -858,7 +1009,15 @@ func (s *DoltStore) Push(ctx context.Context) error {
 
 // ForcePush force-pushes commits to the remote, overwriting remote changes.
 // Use when the remote has uncommitted changes in its working set.
-func (s *DoltStore) ForcePush(ctx context.Context) error {
+func (s *DoltStore) ForcePush(ctx context.Context) (retErr error) {
+	ctx, span := doltTracer.Start(ctx, "dolt.force_push",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(append(s.doltSpanAttrs(),
+			attribute.String("dolt.remote", s.remote),
+			attribute.String("dolt.branch", s.branch),
+		)...),
+	)
+	defer func() { endSpan(span, retErr) }()
 	if s.remoteUser != "" {
 		federationEnvMutex.Lock()
 		cleanup := setFederationCredentials(s.remoteUser, s.remotePassword)
@@ -883,7 +1042,15 @@ func (s *DoltStore) ForcePush(ctx context.Context) error {
 // Passes branch explicitly to avoid "did not specify a branch" errors.
 // When remote credentials are configured (for Hosted Dolt), sets DOLT_REMOTE_PASSWORD
 // env var and passes --user flag to authenticate.
-func (s *DoltStore) Pull(ctx context.Context) error {
+func (s *DoltStore) Pull(ctx context.Context) (retErr error) {
+	ctx, span := doltTracer.Start(ctx, "dolt.pull",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(append(s.doltSpanAttrs(),
+			attribute.String("dolt.remote", s.remote),
+			attribute.String("dolt.branch", s.branch),
+		)...),
+	)
+	defer func() { endSpan(span, retErr) }()
 	if s.remoteUser != "" {
 		federationEnvMutex.Lock()
 		cleanup := setFederationCredentials(s.remoteUser, s.remotePassword)
@@ -905,18 +1072,30 @@ func (s *DoltStore) Pull(ctx context.Context) error {
 }
 
 // Branch creates a new branch
-func (s *DoltStore) Branch(ctx context.Context, name string) error {
-	_, err := s.db.ExecContext(ctx, "CALL DOLT_BRANCH(?)", name)
-	if err != nil {
+func (s *DoltStore) Branch(ctx context.Context, name string) (retErr error) {
+	ctx, span := doltTracer.Start(ctx, "dolt.branch",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(append(s.doltSpanAttrs(),
+			attribute.String("dolt.branch", name),
+		)...),
+	)
+	defer func() { endSpan(span, retErr) }()
+	if _, err := s.db.ExecContext(ctx, "CALL DOLT_BRANCH(?)", name); err != nil {
 		return fmt.Errorf("failed to create branch %s: %w", name, err)
 	}
 	return nil
 }
 
 // Checkout switches to the specified branch
-func (s *DoltStore) Checkout(ctx context.Context, branch string) error {
-	_, err := s.db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", branch)
-	if err != nil {
+func (s *DoltStore) Checkout(ctx context.Context, branch string) (retErr error) {
+	ctx, span := doltTracer.Start(ctx, "dolt.checkout",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(append(s.doltSpanAttrs(),
+			attribute.String("dolt.branch", branch),
+		)...),
+	)
+	defer func() { endSpan(span, retErr) }()
+	if _, err := s.db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", branch); err != nil {
 		return fmt.Errorf("failed to checkout branch %s: %w", branch, err)
 	}
 	s.branch = branch
@@ -925,16 +1104,26 @@ func (s *DoltStore) Checkout(ctx context.Context, branch string) error {
 
 // Merge merges the specified branch into the current branch.
 // Returns any merge conflicts if present. Implements storage.VersionedStorage.
-func (s *DoltStore) Merge(ctx context.Context, branch string) ([]storage.Conflict, error) {
+func (s *DoltStore) Merge(ctx context.Context, branch string) (conflicts []storage.Conflict, retErr error) {
+	ctx, span := doltTracer.Start(ctx, "dolt.merge",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(append(s.doltSpanAttrs(),
+			attribute.String("dolt.merge_branch", branch),
+		)...),
+	)
+	defer func() { endSpan(span, retErr) }()
+
 	// DOLT_MERGE may create a merge commit; pass explicit author for determinism.
 	_, err := s.db.ExecContext(ctx, "CALL DOLT_MERGE('--author', ?, ?)", s.commitAuthorString(), branch)
 	if err != nil {
 		// Check if the error is due to conflicts
-		conflicts, conflictErr := s.GetConflicts(ctx)
-		if conflictErr == nil && len(conflicts) > 0 {
-			return conflicts, nil
+		mergeConflicts, conflictErr := s.GetConflicts(ctx)
+		if conflictErr == nil && len(mergeConflicts) > 0 {
+			span.SetAttributes(attribute.Int("dolt.conflicts", len(mergeConflicts)))
+			return mergeConflicts, nil
 		}
-		return nil, fmt.Errorf("failed to merge branch %s: %w", branch, err)
+		retErr = fmt.Errorf("failed to merge branch %s: %w", branch, err)
+		return nil, retErr
 	}
 	return nil, nil
 }

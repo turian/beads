@@ -19,7 +19,6 @@ bd [global-flags] <command> [command-flags] [arguments]
 | Flag | Description |
 |------|-------------|
 | `--db <path>` | Use specific database file |
-| `--no-daemon` | Bypass daemon, direct database access |
 | `--json` | Output in JSON format |
 | `--quiet` | Suppress non-essential output |
 | `--verbose` | Verbose output |
@@ -79,8 +78,8 @@ Most frequently used:
 | Command | Description |
 |---------|-------------|
 | `bd sync` | Full sync cycle |
-| `bd export` | Export to JSONL |
-| `bd import` | Import from JSONL |
+| `bd export` | Export data to JSONL |
+| `bd import` | Import data from JSONL |
 | `bd migrate` | Migrate database schema |
 
 ### System
@@ -91,7 +90,7 @@ Most frequently used:
 | `bd info` | Show system info |
 | `bd version` | Show version |
 | `bd config` | Manage configuration |
-| `bd daemons` | Manage daemons |
+| `bd doctor` | Check system health |
 | `bd hooks` | Manage git hooks |
 
 ### Workflows
@@ -166,14 +165,14 @@ bd blocked
 ### Syncing
 
 ```bash
-# Full sync (export + commit + push)
+# Full sync (Dolt commit + push)
 bd sync
 
-# Force export
-bd export
+# Export to file
+bd export -o backup.jsonl
 
 # Import from file
-bd import -i .beads/issues.jsonl
+bd import -i backup.jsonl
 ```
 
 ## See Also

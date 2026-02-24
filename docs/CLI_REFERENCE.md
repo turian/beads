@@ -19,14 +19,13 @@
 ### Check Status
 
 ```bash
-# Check database path and daemon status
+# Check database path and server status
 bd info --json
 
 # Example output:
 # {
 #   "database_path": "/path/to/.beads/beads.db",
 #   "issue_prefix": "bd",
-#   "daemon_running": true,
 #   "agent_mail_enabled": false
 # }
 ```
@@ -283,17 +282,13 @@ When detected, you'll see: `ℹ️  Sandbox detected, using direct mode`
 ```bash
 # Explicitly enable sandbox mode
 bd --sandbox <command>
-
-# Equivalent to combining these flags:
-bd --no-daemon --no-auto-flush --no-auto-import <command>
 ```
 
 **What it does:**
-- Disables daemon (uses direct SQLite mode)
-- Disables auto-export to JSONL
-- Disables auto-import from JSONL
+- Uses embedded database mode (no server needed)
+- Disables auto-sync operations
 
-**When to use:** Sandboxed environments where daemon can't be controlled (permission restrictions), or when auto-detection doesn't trigger.
+**When to use:** Sandboxed environments where the Dolt server can't be controlled (permission restrictions), or when auto-detection doesn't trigger.
 
 ### Staleness Control
 
@@ -301,7 +296,7 @@ bd --no-daemon --no-auto-flush --no-auto-import <command>
 # Skip staleness check (emergency escape hatch)
 bd --allow-stale <command>
 
-# Example: access database even if out of sync with JSONL
+# Example: access database even if it appears out of sync
 bd --allow-stale ready --json
 bd --allow-stale list --status open --json
 ```
@@ -319,7 +314,7 @@ bd import --force -i .beads/issues.jsonl
 
 **When to use:** `bd import` reports "0 created, 0 updated" but staleness errors persist.
 
-**Shows:** `Metadata updated (database already in sync with JSONL)`
+**Shows:** `Metadata updated (database already in sync)`
 
 ### Other Global Flags
 
@@ -327,12 +322,9 @@ bd import --force -i .beads/issues.jsonl
 # JSON output for programmatic use
 bd --json <command>
 
-# Force direct mode (bypass daemon)
-bd --no-daemon <command>
-
 # Disable auto-sync
-bd --no-auto-flush <command>    # Disable auto-export to JSONL
-bd --no-auto-import <command>   # Disable auto-import from JSONL
+bd --no-auto-flush <command>    # Disable auto-flush
+bd --no-auto-import <command>   # Disable auto-import
 
 # Custom database path
 bd --db /path/to/.beads/beads.db <command>
@@ -426,15 +418,15 @@ bd admin reset --force
 ```
 
 **What gets removed:**
-- `.beads/` directory (database, JSONL, config)
+- `.beads/` directory (database, config)
 - Git hooks installed by bd
 - Merge driver configuration
 - Sync branch worktrees (`.git/beads-worktrees/`)
 
 **What does NOT get removed:**
 - Remote sync branch (if configured)
-- JSONL history in git commits
-- Remote repository data
+- Remote Dolt repository data
+- Historical git commits
 
 **Important:** If you want a complete clean slate (including remote data), see [Troubleshooting: Old data returns after reset](TROUBLESHOOTING.md#old-data-returns-after-reset).
 
@@ -553,7 +545,7 @@ bd mol burn <ephemeral-id> --dry-run
 bd mol burn <ephemeral-id> --force --json
 ```
 
-**Note:** Most mol commands require `--no-daemon` flag when daemon is running.
+**Note:** Mol commands use the standard Dolt database access path.
 
 ## Database Management
 
@@ -668,15 +660,14 @@ bd migrate sync beads-sync --orphan                    # Delete and recreate as 
 ### Sync Operations
 
 ```bash
-# Manual sync (force immediate export/import/commit/push)
+# Manual sync (force immediate commit/push)
 bd sync
 
 # What it does:
-# 1. Export pending changes to JSONL
-# 2. Commit to git
-# 3. Pull from remote
-# 4. Import any updates
-# 5. Push to remote
+# 1. Commit pending changes to Dolt
+# 2. Pull from remote
+# 3. Merge any updates
+# 4. Push to remote
 ```
 
 ### Key-Value Store
@@ -705,8 +696,7 @@ bd kv list --json                      # Machine-readable output
 
 **Storage notes:**
 - KV data is stored in the local database with a `kv.` prefix
-- In `dolt-native` or `belt-and-suspenders` sync modes, KV data syncs via Dolt remotes
-- In `git-portable` mode, KV data stays local (not exported to JSONL)
+- KV data syncs via Dolt remotes
 
 **Use cases:**
 - Feature flags: `bd set debug_mode true`
@@ -760,7 +750,7 @@ Only `blocks` dependencies affect the ready work queue.
 The `--external-ref` flag (v0.9.2+) links beads issues to external trackers:
 
 - Supports short form (`gh-123`) or full URL (`https://github.com/...`)
-- Portable via JSONL - survives sync across machines
+- Portable via Dolt - survives sync across machines
 - Custom prefixes work for any tracker (`jira-PROJ-456`, `linear-789`)
 
 ## Output Formats
@@ -869,6 +859,7 @@ bd sync  # Force immediate sync, bypass debounce
 # Setup editor integration (choose based on your editor)
 bd setup factory  # Factory.ai Droid - creates/updates AGENTS.md (universal standard)
 bd setup codex    # Codex CLI - creates/updates AGENTS.md
+bd setup mux      # Mux - creates/updates AGENTS.md
 bd setup claude   # Claude Code - installs SessionStart/PreCompact hooks
 bd setup cursor   # Cursor IDE - creates .cursor/rules/beads.mdc
 bd setup aider    # Aider - creates .aider.conf.yml
@@ -876,6 +867,7 @@ bd setup aider    # Aider - creates .aider.conf.yml
 # Check if integration is installed
 bd setup factory --check
 bd setup codex --check
+bd setup mux --check
 bd setup claude --check
 bd setup cursor --check
 bd setup aider --check
@@ -883,6 +875,7 @@ bd setup aider --check
 # Remove integration
 bd setup factory --remove
 bd setup codex --remove
+bd setup mux --remove
 bd setup claude --remove
 bd setup cursor --remove
 bd setup aider --remove
@@ -893,11 +886,14 @@ bd setup aider --remove
 bd setup claude              # Install globally (~/.claude/settings.json)
 bd setup claude --project    # Install for this project only
 bd setup claude --stealth    # Use stealth mode (flush only, no git operations)
+bd setup mux --project       # Also install .mux/AGENTS.md workspace layer
+bd setup mux --global        # Also install ~/.mux/AGENTS.md global layer
 ```
 
 **What each setup does:**
 - **Factory.ai** (`bd setup factory`): Creates or updates AGENTS.md with beads workflow instructions (works with multiple AI tools using the AGENTS.md standard)
 - **Codex CLI** (`bd setup codex`): Creates or updates AGENTS.md with beads workflow instructions for Codex
+- **Mux** (`bd setup mux`): Creates or updates AGENTS.md with beads workflow instructions for Mux workspaces
 - **Claude Code** (`bd setup claude`): Adds hooks to Claude Code's settings.json that run `bd prime` on SessionStart and PreCompact events
 - **Cursor** (`bd setup cursor`): Creates `.cursor/rules/beads.mdc` with workflow instructions
 - **Aider** (`bd setup aider`): Creates `.aider.conf.yml` with bd workflow instructions

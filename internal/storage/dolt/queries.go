@@ -419,12 +419,27 @@ func (s *DoltStore) GetReadyWork(ctx context.Context, filter types.WorkFilter) (
 			args = append(args, label)
 		}
 	}
+	// Parent filtering: filter to children of specified parent (GH#2009)
+	if filter.ParentID != nil {
+		parentID := *filter.ParentID
+		whereClauses = append(whereClauses, "(id IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child' AND depends_on_id = ?) OR id LIKE CONCAT(?, '.%'))")
+		args = append(args, parentID, parentID)
+	}
 
 	// Exclude blocked issues: pre-compute blocked set using separate single-table
 	// queries to avoid Dolt's joinIter panic (join_iters.go:192).
 	// Correlated EXISTS/NOT EXISTS subqueries across tables trigger the same panic.
 	blockedIDs, err := s.computeBlockedIDs(ctx)
 	if err == nil && len(blockedIDs) > 0 {
+		// Also exclude children of blocked parents (GH#1495):
+		// If a parent/epic is blocked, its children should not appear as ready work.
+		childrenOfBlocked, childErr := s.getChildrenOfIssues(ctx, blockedIDs)
+		if childErr == nil {
+			for _, childID := range childrenOfBlocked {
+				blockedIDs = append(blockedIDs, childID)
+			}
+		}
+
 		placeholders := make([]string, len(blockedIDs))
 		for i, id := range blockedIDs {
 			placeholders[i] = "?"
@@ -524,17 +539,27 @@ func (s *DoltStore) GetBlockedIssues(ctx context.Context, filter types.WorkFilte
 		return nil, err
 	}
 
-	// Step 2: Get all blocking dependencies (single-table scan)
+	// Step 2: Get canonical blocked set via computeBlockedIDs, which handles
+	// both 'blocks' and 'waits-for' dependencies with full gate evaluation.
+	blockedIDList, err := s.computeBlockedIDs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute blocked IDs: %w", err)
+	}
+	blockedSet := make(map[string]bool, len(blockedIDList))
+	for _, id := range blockedIDList {
+		blockedSet[id] = true
+	}
+
+	// Step 3: Get blocking + waits-for deps to build BlockedBy lists
 	depRows, err := s.queryContext(ctx, `
 		SELECT issue_id, depends_on_id FROM dependencies
-		WHERE type = 'blocks'
+		WHERE type IN ('blocks', 'waits-for')
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get blocking dependencies: %w", err)
 	}
 
-	// Step 3: Filter in Go — both sides must be active
-	// blockerMap: blocked_issue_id -> list of active blocker IDs
+	// blockerMap: blocked_issue_id -> list of active blocker/spawner IDs
 	blockerMap := make(map[string][]string)
 	for depRows.Next() {
 		var issueID, blockerID string
@@ -542,7 +567,8 @@ func (s *DoltStore) GetBlockedIssues(ctx context.Context, filter types.WorkFilte
 			_ = depRows.Close() // Best effort cleanup on error path
 			return nil, err
 		}
-		if activeIDs[issueID] && activeIDs[blockerID] {
+		// Only include if computeBlockedIDs confirmed this issue is blocked
+		if blockedSet[issueID] && activeIDs[blockerID] {
 			blockerMap[issueID] = append(blockerMap[issueID], blockerID)
 		}
 	}
@@ -565,8 +591,32 @@ func (s *DoltStore) GetBlockedIssues(ctx context.Context, filter types.WorkFilte
 		issueMap[issue.ID] = issue
 	}
 
+	// Parent filtering: restrict to children of specified parent (GH#2009)
+	var parentChildSet map[string]bool
+	if filter.ParentID != nil {
+		parentChildSet = make(map[string]bool)
+		parentID := *filter.ParentID
+		children, childErr := s.getChildrenOfIssues(ctx, []string{parentID})
+		if childErr == nil {
+			for _, childID := range children {
+				parentChildSet[childID] = true
+			}
+		}
+		// Also include dotted-ID children (e.g., "parent.1.2")
+		for id := range blockerMap {
+			if strings.HasPrefix(id, parentID+".") {
+				parentChildSet[id] = true
+			}
+		}
+	}
+
 	var results []*types.BlockedIssue
 	for id, blockerIDs := range blockerMap {
+		// Skip issues not under requested parent (GH#2009)
+		if parentChildSet != nil && !parentChildSet[id] {
+			continue
+		}
+
 		issue, ok := issueMap[id]
 		if !ok || issue == nil {
 			continue
@@ -842,30 +892,166 @@ func (s *DoltStore) computeBlockedIDs(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 
-	// Step 2: Get all blocking dependencies (single-table scan)
+	// Step 2: Get blocking deps and waits-for gates (single-table scan)
 	depRows, err := s.queryContext(ctx, `
-		SELECT issue_id, depends_on_id FROM dependencies
-		WHERE type = 'blocks'
+		SELECT issue_id, depends_on_id, type, metadata FROM dependencies
+		WHERE type IN ('blocks', 'waits-for')
 	`)
 	if err != nil {
 		return nil, err
 	}
 
-	// Step 3: Filter in Go — both sides must be active
+	type waitsForDep struct {
+		issueID   string
+		spawnerID string
+		gate      string
+	}
+	var waitsForDeps []waitsForDep
+	needsClosedChildren := false
+
+	// Step 3: Filter direct blockers in Go; collect waits-for edges
 	blockedSet := make(map[string]bool)
 	for depRows.Next() {
-		var issueID, blockerID string
-		if err := depRows.Scan(&issueID, &blockerID); err != nil {
+		var issueID, dependsOnID, depType string
+		var metadata sql.NullString
+		if err := depRows.Scan(&issueID, &dependsOnID, &depType, &metadata); err != nil {
 			_ = depRows.Close() // Best effort cleanup on error path
 			return nil, err
 		}
-		if activeIDs[issueID] && activeIDs[blockerID] {
-			blockedSet[issueID] = true
+
+		switch depType {
+		case string(types.DepBlocks):
+			if activeIDs[issueID] && activeIDs[dependsOnID] {
+				blockedSet[issueID] = true
+			}
+		case string(types.DepWaitsFor):
+			// waits-for only matters for active gate issues
+			if !activeIDs[issueID] {
+				continue
+			}
+			gate := types.ParseWaitsForGateMetadata(metadata.String)
+			if gate == types.WaitsForAnyChildren {
+				needsClosedChildren = true
+			}
+			waitsForDeps = append(waitsForDeps, waitsForDep{
+				issueID: issueID,
+				// depends_on_id is the canonical spawner ID for waits-for edges.
+				// metadata.spawner_id is parsed for compatibility but not required here.
+				spawnerID: dependsOnID,
+				gate:      gate,
+			})
 		}
 	}
 	_ = depRows.Close() // Redundant close for safety (rows already iterated)
 	if err := depRows.Err(); err != nil {
 		return nil, err
+	}
+
+	if len(waitsForDeps) > 0 {
+		// Step 4: Load direct children for each waits-for spawner.
+		spawnerIDs := make(map[string]struct{})
+		for _, dep := range waitsForDeps {
+			spawnerIDs[dep.spawnerID] = struct{}{}
+		}
+
+		placeholders := make([]string, 0, len(spawnerIDs))
+		args := make([]interface{}, 0, len(spawnerIDs))
+		for spawnerID := range spawnerIDs {
+			placeholders = append(placeholders, "?")
+			args = append(args, spawnerID)
+		}
+
+		// nolint:gosec // G201: placeholders are generated values, data passed via args
+		childQuery := fmt.Sprintf(`
+			SELECT issue_id, depends_on_id FROM dependencies
+			WHERE type = 'parent-child' AND depends_on_id IN (%s)
+		`, strings.Join(placeholders, ","))
+		childRows, err := s.queryContext(ctx, childQuery, args...)
+		if err != nil {
+			return nil, err
+		}
+
+		spawnerChildren := make(map[string][]string)
+		childIDs := make(map[string]struct{})
+		for childRows.Next() {
+			var childID, parentID string
+			if err := childRows.Scan(&childID, &parentID); err != nil {
+				_ = childRows.Close() // Best effort cleanup on error path
+				return nil, err
+			}
+			spawnerChildren[parentID] = append(spawnerChildren[parentID], childID)
+			childIDs[childID] = struct{}{}
+		}
+		_ = childRows.Close()
+		if err := childRows.Err(); err != nil {
+			return nil, err
+		}
+
+		closedChildren := make(map[string]bool)
+		if needsClosedChildren && len(childIDs) > 0 {
+			childPlaceholders := make([]string, 0, len(childIDs))
+			childArgs := make([]interface{}, 0, len(childIDs))
+			for childID := range childIDs {
+				childPlaceholders = append(childPlaceholders, "?")
+				childArgs = append(childArgs, childID)
+			}
+
+			// nolint:gosec // G201: placeholders are generated values, data passed via args
+			closedQuery := fmt.Sprintf(`
+				SELECT id FROM issues
+				WHERE status = 'closed' AND id IN (%s)
+			`, strings.Join(childPlaceholders, ","))
+			closedRows, err := s.queryContext(ctx, closedQuery, childArgs...)
+			if err != nil {
+				return nil, err
+			}
+			for closedRows.Next() {
+				var childID string
+				if err := closedRows.Scan(&childID); err != nil {
+					_ = closedRows.Close() // Best effort cleanup on error path
+					return nil, err
+				}
+				closedChildren[childID] = true
+			}
+			_ = closedRows.Close()
+			if err := closedRows.Err(); err != nil {
+				return nil, err
+			}
+		}
+
+		// Step 5: Evaluate waits-for gates against current child states.
+		for _, dep := range waitsForDeps {
+			children := spawnerChildren[dep.spawnerID]
+			switch dep.gate {
+			case types.WaitsForAnyChildren:
+				// Block only while spawned children are active and none have completed.
+				if len(children) == 0 {
+					continue
+				}
+				hasClosedChild := false
+				hasActiveChild := false
+				for _, childID := range children {
+					if closedChildren[childID] {
+						hasClosedChild = true
+						break
+					}
+					if activeIDs[childID] {
+						hasActiveChild = true
+					}
+				}
+				if !hasClosedChild && hasActiveChild {
+					blockedSet[dep.issueID] = true
+				}
+			default:
+				// all-children / children-of(step): block while any child remains active.
+				for _, childID := range children {
+					if activeIDs[childID] {
+						blockedSet[dep.issueID] = true
+						break
+					}
+				}
+			}
+		}
 	}
 
 	result := make([]string, 0, len(blockedSet))
@@ -890,6 +1076,40 @@ func (s *DoltStore) invalidateBlockedIDsCache() {
 	s.blockedIDsCache = nil
 	s.blockedIDsCacheMap = nil
 	s.cacheMu.Unlock()
+}
+
+// getChildrenOfIssues returns IDs of direct children (parent-child deps) of the given issue IDs.
+// Used to propagate blocked status from parents to children (GH#1495).
+func (s *DoltStore) getChildrenOfIssues(ctx context.Context, parentIDs []string) ([]string, error) {
+	if len(parentIDs) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(parentIDs))
+	args := make([]interface{}, len(parentIDs))
+	for i, id := range parentIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	// nolint:gosec // G201: placeholders are generated values, data passed via args
+	query := fmt.Sprintf(`
+		SELECT issue_id FROM dependencies
+		WHERE type = 'parent-child' AND depends_on_id IN (%s)
+	`, strings.Join(placeholders, ","))
+	rows, err := s.queryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var children []string
+	for rows.Next() {
+		var childID string
+		if err := rows.Scan(&childID); err != nil {
+			return nil, err
+		}
+		children = append(children, childID)
+	}
+	return children, rows.Err()
 }
 
 // GetMoleculeProgress returns progress stats for a molecule

@@ -48,11 +48,12 @@ bd update bd-XXXXX --status in_progress
 
 **Note:** Replace `bd-XXXXX` etc. with actual issue IDs created above.
 
-### 3. Auto-Sync (Daemon)
+### 3. Auto-Sync (Server Mode)
 
 ```bash
-# Start daemon with auto-commit
-bd daemon start --auto-commit
+# Start Dolt server with auto-commit
+bd config set dolt.auto-commit on
+bd dolt start
 
 # All issue changes are now automatically committed to beads-metadata branch
 ```
@@ -67,9 +68,9 @@ git log beads-metadata --oneline | head -5
 bd sync --status
 ```
 
-### 4. Manual Sync (Without Daemon)
+### 4. Manual Sync (Without Server)
 
-If you're not using the daemon:
+If you're not using the Dolt server:
 
 ```bash
 # Create or update issues
@@ -145,10 +146,11 @@ bd list  # See the new feature issue
          │
          ▼
 ┌─────────────────┐
-│  Daemon (or     │
-│  manual sync)   │
-│  commits to     │
-│  beads-metadata │
+│  Dolt server    │
+│  (or manual     │
+│  sync) commits  │
+│  to beads-      │
+│  metadata       │
 └────────┬────────┘
          │
          ▼
@@ -176,12 +178,11 @@ my-project/
 │   ├── beads-worktrees/       # Hidden worktree directory
 │   │   └── beads-metadata/    # Lightweight checkout of sync branch
 │   │       └── .beads/
-│   │           └── issues.jsonl
+│   │           └── dolt/
 │   └── ...
 ├── .beads/                    # Main beads directory (in your workspace)
-│   ├── beads.db               # SQLite database
-│   ├── issues.jsonl            # JSONL export
-│   └── bd.sock                # Daemon socket (if running)
+│   ├── dolt/                  # Dolt database (source of truth)
+│   └── config.yaml            # Beads configuration
 ├── src/                       # Your application code
 │   └── ...
 └── README.md
@@ -204,31 +205,31 @@ my-project/
 ### For AI Agents
 
 - **No workflow changes:** Agents use `bd create`, `bd update`, etc. as normal
-- **Let daemon handle it:** With `--auto-commit`, agents don't think about sync
+- **Let the Dolt server handle it:** With auto-commit enabled, agents don't think about sync
 - **Session end:** Run `bd sync` at end of session to ensure everything is committed
 
 ### Troubleshooting
 
-**"Merge conflicts in issues.jsonl"**
+**"Merge conflicts during sync"**
 
-JSONL is append-only and line-based, so conflicts are rare. If they occur:
-1. Both versions are usually valid - keep both lines
-2. If same issue updated differently, keep the line with newer `updated_at`
-3. After resolving: `bd import` to update database
+Dolt handles merges natively using three-way merge. If conflicts occur:
+1. Run `bd sql "SELECT * FROM dolt_conflicts"` to view them
+2. Resolve with `bd sql "CALL dolt_conflicts_resolve('--ours')"` or `'--theirs'`
+3. Complete with `bd sync`
 
 **"Worktree doesn't exist"**
 
-The daemon creates it automatically on first commit. To create manually:
+The Dolt server creates it automatically on first commit. To create manually:
 ```bash
 bd config get sync.branch  # Verify it's set
-bd daemon stop && bd daemon start          # Daemon will create worktree
+bd dolt stop && bd dolt start              # Server will create worktree
 ```
 
 **"Changes not syncing"**
 
 Make sure:
 - `bd config get sync.branch` returns the same value on all clones
-- Daemon is running: `bd daemon status`
+- Dolt server is running: `bd doctor`
 - Both clones have fetched: `git fetch origin beads-metadata`
 
 ## Advanced: GitHub Actions Integration

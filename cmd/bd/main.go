@@ -24,7 +24,10 @@ import (
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/molecules"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/telemetry"
 	"github.com/steveyegge/beads/internal/utils"
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // Command group IDs for help organization
@@ -49,9 +52,6 @@ var (
 	// Store concurrency protection
 	storeMutex  sync.Mutex // Protects store access from background goroutine
 	storeActive = false    // Tracks if store is available
-
-	// No-db mode
-	noDb bool // Use --no-db mode: load from JSONL, write back after each command
 
 	// Version upgrade tracking
 	versionUpgradeDetected = false // Set to true if bd version changed since last run
@@ -91,6 +91,10 @@ var (
 	// commandTipIDsShown tracks which tip IDs were shown in this command (deduped).
 	// This is used for tip-commit message formatting.
 	commandTipIDsShown map[string]struct{}
+
+	// commandSpan is the root OTel span for the current command execution.
+	// All storage and AI spans are nested as children of this span.
+	commandSpan oteltrace.Span
 )
 
 // readOnlyCommands lists commands that only read from the database.
@@ -107,7 +111,7 @@ var readOnlyCommands = map[string]bool{
 	"duplicates": true,
 	"comments":   true, // list comments (not add)
 	"current":    true, // bd sync mode current
-	// NOTE: "export" is NOT read-only - it writes to clear dirty issues and update jsonl_file_hash
+	// NOTE: "export" is NOT read-only - it writes to clear dirty issues
 }
 
 // isReadOnlyCommand returns true if the command only reads from the database.
@@ -245,6 +249,22 @@ var rootCmd = &cobra.Command{
 		// pending batch commits before canceling the context.
 		rootCtx, rootCancel = setupGracefulShutdown()
 
+		// Initialize OTel (no-op unless BD_OTEL_METRICS_URL or BD_OTEL_STDOUT=true).
+		// Must run before any DB access so SQL spans nest under command spans.
+		if err := telemetry.Init(rootCtx, "bd", Version); err != nil {
+			debug.Logf("warning: telemetry init failed: %v", err)
+		}
+
+		// Start root span for this command. rootCtx now carries the span, so
+		// all downstream DB and AI calls become child spans automatically.
+		rootCtx, commandSpan = telemetry.Tracer("bd").Start(rootCtx, "bd.command."+cmd.Name(),
+			oteltrace.WithAttributes(
+				attribute.String("bd.command", cmd.Name()),
+				attribute.String("bd.version", Version),
+				attribute.String("bd.args", strings.Join(os.Args[1:], " ")),
+			),
+		)
+
 		// Apply verbosity flags early (before any output)
 		debug.SetVerbose(verboseFlag)
 		debug.SetQuiet(quietFlag)
@@ -319,7 +339,7 @@ var rootCmd = &cobra.Command{
 			FatalError("%v", err)
 		}
 
-		// GH#1093: Check noDbCommands BEFORE expensive operations (ensureForkProtection)
+		// GH#1093: Check noDbCommands BEFORE expensive operations
 		// to avoid spawning git subprocesses for simple commands
 		// like "bd version" that don't need database access.
 		noDbCommands := []string{
@@ -328,7 +348,7 @@ var rootCmd = &cobra.Command{
 			"bash",
 			"completion",
 			"doctor",
-			"dolt",
+			"dolt", // bare "bd dolt" shows help only; subcommands handled below
 			"fish",
 			"help",
 			"hook", // manages its own store lifecycle (#1719)
@@ -347,11 +367,19 @@ var rootCmd = &cobra.Command{
 			"version",
 			"zsh",
 		}
+
+		// GH#2042: Dolt subcommands that need the store for version-control operations.
+		// All other dolt subcommands (show, set, test, start, stop, status) are
+		// config/diagnostic commands that skip DB init via the "dolt" parent entry above.
+		needsStoreDoltSubcommands := []string{"push", "pull", "commit"}
+
 		// Check both the command name and parent command name for subcommands
 		cmdName := cmd.Name()
 		if cmd.Parent() != nil {
 			parentName := cmd.Parent().Name()
-			if slices.Contains(noDbCommands, parentName) {
+			if parentName == "dolt" && slices.Contains(needsStoreDoltSubcommands, cmdName) {
+				// GH#2042: dolt push/pull/commit need the store — fall through to init
+			} else if slices.Contains(noDbCommands, parentName) {
 				return
 			}
 		}
@@ -368,9 +396,6 @@ var rootCmd = &cobra.Command{
 		if v, _ := cmd.Flags().GetBool("version"); v {
 			return
 		}
-
-		// Protect forks from accidentally committing upstream issue database
-		ensureForkProtection()
 
 		// Performance profiling setup
 		if profileEnabled {
@@ -393,10 +418,10 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		// --no-db mode has been removed; only Dolt is supported
-		if noDb {
-			FatalError("--no-db mode has been removed; beads now requires Dolt (run 'bd init' to create a database)")
-		}
+		// Auto-migrate SQLite to Dolt if a legacy beads.db is detected (bd-3dx).
+		// This must run BEFORE database path resolution because FindDatabasePath()
+		// only looks for Dolt databases — a SQLite-only .beads/ would be invisible.
+		autoMigrateSQLiteToDolt()
 
 		// Initialize database path
 		if dbPath == "" {
@@ -404,10 +429,7 @@ var rootCmd = &cobra.Command{
 			if foundDB := beads.FindDatabasePath(); foundDB != "" {
 				dbPath = foundDB
 			} else {
-				// No database found
-				beadsDir := beads.FindBeadsDir()
-
-				// Allow some commands to run without a database
+				// No database found — allow some commands to run without a database
 				// - import: auto-initializes database if missing
 				// - setup: creates editor integration files (no DB needed)
 				// - config set/get for yaml-only keys: writes to config.yaml, not db (GH#536)
@@ -418,48 +440,9 @@ var rootCmd = &cobra.Command{
 					}
 				}
 
-				// Allow read-only commands to auto-bootstrap from JSONL (GH#b09)
-				// This enables `bd show` after cold-start when DB is missing.
-				// IMPORTANT: If metadata.json says the backend is Dolt, we must NOT
-				// silently create a different database — that causes contamination.
-				// Error out instead so the user can fix the Dolt connection. (gt-r1nex)
-				canAutoBootstrap := false
-				if isReadOnlyCommand(cmd.Name()) && beadsDir != "" {
-					jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-					if _, err := os.Stat(jsonlPath); err == nil {
-						configuredBackend := dolt.GetBackendFromConfig(beadsDir)
-						if configuredBackend == configfile.BackendDolt {
-							// Dolt backend configured but database not found — don't auto-bootstrap
-							fmt.Fprintf(os.Stderr, "Error: Dolt backend configured but database not found\n")
-							fmt.Fprintf(os.Stderr, "The .beads/metadata.json specifies backend: dolt\n")
-							fmt.Fprintf(os.Stderr, "but no Dolt database was found. Check that the Dolt server is running.\n")
-							fmt.Fprintf(os.Stderr, "\nHint: run 'bd doctor --fix' to diagnose and repair\n")
-							os.Exit(1)
-						}
-						canAutoBootstrap = true
-						debug.Logf("cold-start bootstrap: JSONL exists, allowing auto-create for %s", cmd.Name())
-					}
-				}
-
-				if cmd.Name() != "import" && cmd.Name() != "setup" && !isYamlOnlyConfigOp && !canAutoBootstrap {
+				if cmd.Name() != "import" && cmd.Name() != "setup" && !isYamlOnlyConfigOp {
 					// No database found - provide context-aware error message
 					fmt.Fprintf(os.Stderr, "Error: no beads database found\n")
-
-					// Check if JSONL exists without no-db mode configured
-					if beadsDir != "" {
-						jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-						if _, err := os.Stat(jsonlPath); err == nil {
-							// JSONL exists but no-db mode not configured
-							fmt.Fprintf(os.Stderr, "\nFound JSONL file: %s\n", jsonlPath)
-							fmt.Fprintf(os.Stderr, "This looks like a fresh clone or JSONL-only project.\n\n")
-							fmt.Fprintf(os.Stderr, "Options:\n")
-							fmt.Fprintf(os.Stderr, "  • Run 'bd init' to create database and import issues\n")
-							fmt.Fprintf(os.Stderr, "  • Add 'no-db: true' to .beads/config.yaml for JSONL-only mode\n")
-							os.Exit(1)
-						}
-					}
-
-					// Generic error - no beads directory or JSONL found
 					fmt.Fprintf(os.Stderr, "Hint: run 'bd init' to create a database in the current directory\n")
 					fmt.Fprintf(os.Stderr, "      or set BEADS_DIR to point to your .beads directory\n")
 					os.Exit(1)
@@ -482,6 +465,10 @@ var rootCmd = &cobra.Command{
 
 		// Set actor for audit trail
 		actor = getActorWithGit()
+		// Attach actor to the command span now that we have it.
+		if commandSpan != nil {
+			commandSpan.SetAttributes(attribute.String("bd.actor", actor))
+		}
 
 		// Track bd version changes
 		// Best-effort tracking - failures are silent
@@ -522,6 +509,19 @@ var rootCmd = &cobra.Command{
 			doltCfg.ServerTLS = cfg.GetDoltServerTLS()
 		}
 
+		// Auto-start: enabled by default for standalone users.
+		// Disabled under Gas Town (which manages its own server) or by explicit config.
+		doltCfg.AutoStart = true
+		if os.Getenv("GT_ROOT") != "" {
+			doltCfg.AutoStart = false
+		}
+		if os.Getenv("BEADS_DOLT_AUTO_START") == "0" {
+			doltCfg.AutoStart = false
+		}
+		if v := config.GetString("dolt.auto-start"); v == "false" || v == "0" || v == "off" {
+			doltCfg.AutoStart = false
+		}
+
 		// Server mode defaults auto-commit to OFF because the server handles
 		// commits via its own transaction lifecycle; firing DOLT_COMMIT after
 		// every write under concurrent load causes 'database is read only' errors.
@@ -537,7 +537,7 @@ var rootCmd = &cobra.Command{
 
 		if err != nil {
 			// Check for fresh clone scenario
-			if handleFreshCloneError(err, beadsDir) {
+			if handleFreshCloneError(err) {
 				os.Exit(1)
 			}
 			FatalError("failed to open database: %v", err)
@@ -578,11 +578,6 @@ var rootCmd = &cobra.Command{
 		syncCommandContext()
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
-		// --no-db mode has been removed (memory backend removed)
-		if noDb {
-			return
-		}
-
 		// Dolt auto-commit: after a successful write command (and after final flush),
 		// create a Dolt commit so changes don't remain only in the working set.
 		if commandDidWrite.Load() && !commandDidExplicitDoltCommit {
@@ -626,6 +621,15 @@ var rootCmd = &cobra.Command{
 		if store != nil {
 			_ = store.Close() // Best effort cleanup
 		}
+
+		// End the command span and flush OTel data before process exit.
+		if commandSpan != nil {
+			commandSpan.End()
+			commandSpan = nil
+		}
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		telemetry.Shutdown(shutdownCtx)
+		shutdownCancel()
 
 		if profileFile != nil {
 			pprof.StopCPUProfile()

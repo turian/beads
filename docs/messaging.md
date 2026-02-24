@@ -85,7 +85,7 @@ bd cleanup --ephemeral --older-than 7 --force
 
 Ephemeral messages are:
 - Excluded from `bd ready` by default
-- Not exported to JSONL (transient)
+- Not synced to remotes (transient)
 - Eligible for bulk deletion when closed
 
 ## Identity
@@ -109,7 +109,7 @@ Scripts in `.beads/hooks/` run after certain events:
 | `on_update` | After `bd update` |
 | `on_close` | After `bd close` |
 
-Hooks receive event data as JSON on stdin. This enables orchestrator integration (e.g., notifying daemons of new messages) without beads knowing about the orchestrator.
+Hooks receive event data as JSON on stdin. This enables orchestrator integration (e.g., notifying services of new messages) without beads knowing about the orchestrator.
 
 ## See Also
 

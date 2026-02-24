@@ -386,8 +386,16 @@ var listCmd = &cobra.Command{
 			effectiveLimit = 20 // Agent mode default
 		}
 
+		// When --sort is specified, don't pass Limit to SQL — the hardcoded
+		// ORDER BY would truncate before Go-side sorting (GH#1237).
+		// Instead, apply limit in Go after sortIssues().
+		sqlLimit := effectiveLimit
+		if sortBy != "" {
+			sqlLimit = 0
+		}
+
 		filter := types.IssueFilter{
-			Limit: effectiveLimit,
+			Limit: sqlLimit,
 		}
 
 		// --ready flag: show only open issues (excludes hooked/in_progress/blocked/deferred) (bd-ihu31)
@@ -654,6 +662,11 @@ var listCmd = &cobra.Command{
 		// Apply sorting
 		sortIssues(issues, sortBy, reverse)
 
+		// Apply limit after sorting when --sort deferred it from SQL (GH#1237)
+		if sortBy != "" && effectiveLimit > 0 && len(issues) > effectiveLimit {
+			issues = issues[:effectiveLimit]
+		}
+
 		// Handle watch mode (GH#654) - must be before other output modes
 		if watchMode {
 			watchIssues(ctx, activeStore, filter, sortBy, reverse)
@@ -805,7 +818,7 @@ var listCmd = &cobra.Command{
 }
 
 func init() {
-	listCmd.Flags().StringP("status", "s", "", "Filter by status (open, in_progress, blocked, deferred, closed)")
+	listCmd.Flags().StringP("status", "s", "", "Filter by stored status (open, in_progress, blocked, deferred, closed). Note: dependency-blocked issues use 'bd blocked'")
 	registerPriorityFlag(listCmd, "")
 	listCmd.Flags().StringP("assignee", "a", "", "Filter by assignee")
 	listCmd.Flags().StringP("type", "t", "", "Filter by type (bug, feature, task, epic, chore, decision, merge-request, molecule, gate, convoy). Aliases: mr→merge-request, feat→feature, mol→molecule, dec/adr→decision")

@@ -21,9 +21,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/beads/internal/testutil"
 )
 
 // baselineBin is the path to the pinned baseline bd binary.
@@ -32,24 +35,41 @@ var baselineBin string
 // candidateBin is the path to the bd binary built from the current worktree.
 var candidateBin string
 
+// testDoltServerPort is the port of the isolated Dolt server started by TestMain.
+var testDoltServerPort int
+
 func TestMain(m *testing.M) {
 	if runtime.GOOS == "windows" {
 		fmt.Fprintln(os.Stderr, "regression tests not yet supported on Windows (zip extraction needed)")
 		os.Exit(0)
 	}
 
+	// Start an isolated Dolt server so regression tests don't pollute
+	// the production database on port 3307.
+	if _, err := exec.LookPath("dolt"); err != nil {
+		fmt.Fprintln(os.Stderr, "SKIP: dolt not found in PATH; regression tests require dolt")
+		os.Exit(0)
+	}
+	srv, cleanupServer := testutil.StartTestDoltServer("bd-regression-dolt-*")
+	if srv != nil {
+		testDoltServerPort = srv.Port
+		fmt.Fprintf(os.Stderr, "Test Dolt server running on port %d\n", srv.Port)
+	}
+
 	tmpDir, err := os.MkdirTemp("", "bd-regression-bin-*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "creating temp dir: %v\n", err)
+		cleanupServer()
 		os.Exit(1)
 	}
-	defer os.RemoveAll(tmpDir)
 
 	// Build candidate from current worktree
 	candidateBin = filepath.Join(tmpDir, "bd-candidate")
 	fmt.Fprintln(os.Stderr, "Building candidate binary...")
 	if err := buildCandidate(candidateBin); err != nil {
 		fmt.Fprintf(os.Stderr, "building candidate: %v\n", err)
+		os.RemoveAll(tmpDir)
+		cleanupServer()
 		os.Exit(1)
 	}
 
@@ -58,11 +78,16 @@ func TestMain(m *testing.M) {
 	baselineBin, err = getBaseline()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "getting baseline: %v\n", err)
+		os.RemoveAll(tmpDir)
+		cleanupServer()
 		os.Exit(1)
 	}
 
 	fmt.Fprintf(os.Stderr, "Baseline:  %s\nCandidate: %s\n\n", baselineBin, candidateBin)
-	os.Exit(m.Run())
+	code := m.Run()
+	os.RemoveAll(tmpDir)
+	cleanupServer()
+	os.Exit(code)
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +266,10 @@ func (w *workspace) runEnv() []string {
 		"HOME=" + w.dir,
 		"BEADS_NO_DAEMON=1",
 		"GIT_CONFIG_NOSYSTEM=1",
+	}
+	if testDoltServerPort != 0 {
+		env = append(env, "BEADS_DOLT_PORT="+strconv.Itoa(testDoltServerPort))
+		env = append(env, "BEADS_TEST_MODE=1")
 	}
 	if v := os.Getenv("TMPDIR"); v != "" {
 		env = append(env, "TMPDIR="+v)
@@ -695,3 +724,5 @@ func (w *workspace) tryCreate(args ...string) (string, error) {
 	w.createdIDs = append(w.createdIDs, id)
 	return id, nil
 }
+
+// Test Dolt server cleanup is handled by testutil.StartTestDoltServer.

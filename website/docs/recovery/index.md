@@ -13,7 +13,7 @@ This section provides step-by-step recovery procedures for common Beads issues. 
 | Issue | Symptoms | Runbook |
 |-------|----------|---------|
 | Database Corruption | SQLite errors, missing data | [Database Corruption](/recovery/database-corruption) |
-| Merge Conflicts | JSONL conflicts during sync | [Merge Conflicts](/recovery/merge-conflicts) |
+| Merge Conflicts | Dolt conflicts during sync | [Merge Conflicts](/recovery/merge-conflicts) |
 | Circular Dependencies | Cycle detection errors | [Circular Dependencies](/recovery/circular-dependencies) |
 | Sync Failures | `bd sync` errors | [Sync Failures](/recovery/sync-failures) |
 
@@ -25,8 +25,8 @@ Before diving into specific runbooks, try these quick checks:
 # Check Beads status
 bd status
 
-# Verify daemon is running
-bd daemon status
+# Verify Dolt server is running
+bd doctor
 
 # Check for blocked issues
 bd blocked

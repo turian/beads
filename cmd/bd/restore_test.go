@@ -14,7 +14,7 @@ import (
 
 func TestIssueContentSize(t *testing.T) {
 	tests := []struct {
-		name string
+		name  string
 		issue *types.Issue
 		want  int
 	}{
@@ -38,7 +38,7 @@ func TestIssueContentSize(t *testing.T) {
 			issue: &types.Issue{
 				Description: "some long description text",
 			},
-			want: 25,
+			want: 26,
 		},
 	}
 

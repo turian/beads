@@ -8,7 +8,7 @@ This guide covers multi-repo workflow patterns specifically for AI agents workin
 
 ### Single MCP Server (Recommended)
 
-AI agents should use **one MCP server instance** that automatically routes to per-project daemons:
+AI agents should use **one MCP server instance** that automatically routes to per-project Dolt servers:
 
 ```json
 {
@@ -21,17 +21,17 @@ AI agents should use **one MCP server instance** that automatically routes to pe
 
 The MCP server automatically:
 - Detects current workspace from working directory
-- Routes to correct per-project daemon (`.beads/bd.sock`)
-- Auto-starts daemon if not running
+- Routes to correct per-project Dolt server
+- Auto-starts Dolt server if not running
 - Maintains complete database isolation
 
 **Architecture:**
 ```
 MCP Server (one instance)
     ↓
-Per-Project Daemons (one per workspace)
+Per-Project Dolt Servers (one per workspace)
     ↓
-SQLite Databases (complete isolation)
+Dolt Databases (complete isolation)
 ```
 
 ### Multi-Repo Config Options
@@ -129,10 +129,10 @@ bd list --json | jq '.[] | select(.source_repo == "~/.beads-planning")'
 ```
 
 **How it works:**
-1. Beads reads JSONL from all configured repos
-2. Imports into unified SQLite database
+1. Beads reads from all configured Dolt databases
+2. Aggregates into unified view
 3. Maintains `source_repo` field for provenance
-4. Exports route issues back to correct JSONL files
+4. Routes issues back to correct databases
 
 ## Common Patterns
 
@@ -264,7 +264,7 @@ bd list --json | jq '.[] | select(.source_repo == "~/.beads-planning")'
 bd config get routing.contributor  # Should be ~/.beads-planning
 ```
 
-### Daemon routing to wrong database
+### Server routing to wrong database
 
 **Symptom:** MCP operations affect wrong project
 
@@ -302,10 +302,10 @@ bd doctor quick # Validate local installation health
 - ❌ Don't manually override routing without good reason
 
 ### Teams
-- ✅ Commit `.beads/issues.jsonl` to shared repo
+- ✅ Use `bd dolt push` to sync the shared Dolt database
 - ✅ Use `bd sync` to ensure changes are committed/pushed
 - ✅ Link related issues across repos with dependencies
-- ❌ Don't gitignore `.beads/` - you lose the git ledger
+- ❌ Don't delete `.beads/` - you lose all issue data
 
 ### Multi-Phase Projects
 - ✅ Use clear repo names (`planning`, `impl`, `maint`)
@@ -314,7 +314,7 @@ bd doctor quick # Validate local installation health
 - ❌ Don't duplicate issues across repos
 
 ### General
-- ✅ Always use single MCP server (per-project daemons)
+- ✅ Always use single MCP server (per-project Dolt servers)
 - ✅ Check routing config before filing issues
 - ✅ Use `bd info --json` to verify workspace state
 - ✅ Run `bd sync` at end of session
@@ -327,14 +327,14 @@ Multi-repo mode is fully backward compatible:
 **Without multi-repo config:**
 ```bash
 bd create "Issue" -p 1
-# → Creates in .beads/issues.jsonl (single-repo mode)
+# → Creates in local Dolt database (single-repo mode)
 ```
 
 **With multi-repo config:**
 ```bash
 bd create "Issue" -p 1
 # → Auto-routed based on config
-# → Old issues in .beads/issues.jsonl still work
+# → Old issues in local database still work
 ```
 
 **Disabling multi-repo:**
@@ -382,12 +382,12 @@ bd config get repos.additional
 ### Verify Configuration
 
 ```bash
-# Show all config + database path + daemon status
+# Show all config + database path + server status
 bd info --json
 
 # Sample output:
 {
-  "database_path": "/Users/you/projects/myapp/.beads/beads.db",
+  "database_path": "/Users/you/projects/myapp/.beads/dolt",
   "config": {
     "routing": {
       "mode": "auto",
@@ -399,10 +399,10 @@ bd info --json
       "additional": ["~/repo1", "~/repo2"]
     }
   },
-  "daemon": {
+  "server": {
     "running": true,
     "pid": 12345,
-    "socket": ".beads/bd.sock"
+    "mode": "server"
   }
 }
 ```

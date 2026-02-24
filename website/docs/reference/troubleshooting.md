@@ -53,8 +53,8 @@ bd --db .beads/beads.db list
 ### Database locked
 
 ```bash
-# Stop daemon
-bd daemons killall
+# Stop the Dolt server if running
+bd dolt stop
 
 # Try again
 bd list
@@ -63,25 +63,30 @@ bd list
 ### Corrupted database
 
 ```bash
-# Restore from JSONL
-rm .beads/beads.db
-bd import -i .beads/issues.jsonl
+# Check and fix database
+bd doctor --fix
+
+# Or pull from Dolt remote
+bd dolt pull
+
+# Or restore from a JSONL backup if available
+bd import -i backup.jsonl
 ```
 
-## Daemon Issues
+## Dolt Server Issues
 
-### Daemon not starting
+### Server not starting
 
 ```bash
-# Check status
-bd info
+# Check server health
+bd doctor
 
-# Remove stale socket
-rm -f .beads/bd.sock
+# Check server logs
+cat .beads/dolt/sql-server.log
 
-# Restart
-bd daemons killall
-bd info
+# Restart the server
+bd dolt stop
+bd dolt start
 ```
 
 ### Version mismatch
@@ -89,16 +94,8 @@ bd info
 After upgrading bd:
 
 ```bash
-bd daemons killall
-bd info
-```
-
-### High CPU usage
-
-```bash
-# Switch to event-driven mode
-export BEADS_DAEMON_MODE=events
-bd daemons killall
+bd dolt stop
+bd dolt start
 ```
 
 ## Sync Issues
@@ -109,9 +106,6 @@ bd daemons killall
 # Force sync
 bd sync
 
-# Check daemon
-bd info | grep daemon
-
 # Check hooks
 bd hooks status
 ```
@@ -120,7 +114,7 @@ bd hooks status
 
 ```bash
 # Allow orphans
-bd import -i .beads/issues.jsonl --orphan-handling allow
+bd import -i backup.jsonl --orphan-handling allow
 
 # Check for duplicates after
 bd duplicates
@@ -129,12 +123,10 @@ bd duplicates
 ### Merge conflicts
 
 ```bash
-# Use merge driver
-bd init  # Setup merge driver
+# Check for and fix Dolt conflicts
+bd doctor --fix
 
-# Or manual resolution
-git checkout --ours .beads/issues.jsonl
-bd import -i .beads/issues.jsonl
+# Re-sync
 bd sync
 ```
 
@@ -212,7 +204,7 @@ bd --verbose list
 ### Logs
 
 ```bash
-bd daemons logs . -n 100
+cat .beads/dolt/sql-server.log
 ```
 
 ### System info

@@ -46,8 +46,8 @@ export BD_FEDERATION_SOVEREIGNTY="T2"
 
 | Mode | Description | Federation Support |
 |------|-------------|-------------------|
-| `git-portable` | JSONL export to git (default) | No |
-| `dolt-native` | Dolt remotes only | Yes |
+| `dolt-native` | Dolt remotes (default) | Yes |
+| `git-portable` | Legacy JSONL export to git | No |
 | `belt-and-suspenders` | Dolt + JSONL backup | Yes |
 
 ### Data Sovereignty Tiers
@@ -152,8 +152,8 @@ as commands:
 
 ### "requires direct database access"
 
-Federation commands require the Dolt backend. Ensure you're not running in
-daemon mode for federation operations.
+Federation commands require the Dolt backend with direct database access. Ensure
+you have the Dolt backend configured for federation operations.
 
 ### "peer already exists"
 

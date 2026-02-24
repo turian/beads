@@ -41,7 +41,7 @@ This document covers **what to test** and **what not to test**. For how to run t
 - Config file parsing
 - CLI argument handling
 
-**In beads**: Tests tagged with `//go:build integration`, daemon tests
+**In beads**: Tests tagged with `//go:build integration`, server mode tests
 
 ### Tier 3: E2E / Smoke Tests (1-5 minutes)
 
@@ -69,7 +69,7 @@ A good test:
 | Priority | What | Why | Examples in beads |
 |----------|------|-----|-------------------|
 | **High** | Core business logic | This is what users depend on | `sync`, `doctor`, `export`, `import` |
-| **High** | Error paths that could corrupt data | Data loss is catastrophic | Config handling, git operations, JSONL integrity |
+| **High** | Error paths that could corrupt data | Data loss is catastrophic | Config handling, git operations, database integrity |
 | **Medium** | Edge cases from production bugs | Discovered through real issues | Orphan handling, ID collision detection |
 | **Low** | Display/formatting | Visual output, can be manually verified | Table formatting, color output |
 
@@ -164,16 +164,16 @@ for k, want := range expectedMap {
 Unit tests that execute real commands or heavy I/O when they could mock.
 
 ```go
-// BAD: Actually executes bd killall in unit test
-func TestDaemonFix(t *testing.T) {
-    exec.Command("bd", "killall").Run()
+// BAD: Actually executes external commands in unit test
+func TestServerFix(t *testing.T) {
+    exec.Command("bd", "dolt", "stop").Run()
     // ...
 }
 
 // GOOD: Mock the execution or use integration test tag
-func TestDaemonFix(t *testing.T) {
+func TestServerFix(t *testing.T) {
     executor := &mockExecutor{}
-    fix := NewDaemonFix(executor)
+    fix := NewServerFix(executor)
     // ...
 }
 ```
@@ -184,10 +184,10 @@ Tests that break when you refactor, even though behavior is unchanged.
 
 ```go
 // BAD: Tests internal state
-if len(daemon.connectionPool) != 3 { t.Error(...) }
+if len(server.connectionPool) != 3 { t.Error(...) }
 
 // GOOD: Tests observable behavior
-if resp, err := daemon.HandleRequest(req); err != nil { t.Error(...) }
+if resp, err := server.HandleRequest(req); err != nil { t.Error(...) }
 ```
 
 ### 5. Missing Boundary Tests
@@ -235,13 +235,13 @@ TestPriority(5)  // boundary - first invalid
 | Sync/Export/Import | Data integrity critical - comprehensive edge cases |
 | SQLite transactions | Rollback safety, atomicity guarantees |
 | Merge operations | 3-way merge with conflict resolution |
-| Daemon locking | Prevents corruption from multiple instances |
+| Database locking | Prevents corruption from multiple instances |
 
 ### Needs Attention
 
 | Area | Gap | Priority |
 |------|-----|----------|
-| Daemon lifecycle | Shutdown/signal handling | Medium |
+| Server lifecycle | Shutdown/signal handling | Medium |
 | Concurrent operations | Stress testing under load | Medium |
 | Boundary validation | Edge inputs in mapping functions | Low |
 
