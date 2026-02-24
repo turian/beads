@@ -1,11 +1,10 @@
-//go:build cgo
-
 package dolt
 
 import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -31,11 +30,17 @@ func testContext(t *testing.T) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), testTimeout)
 }
 
-// skipIfNoDolt skips the test if Dolt is not installed
+// skipIfNoDolt skips the test if Dolt is not installed or the test server
+// is not running. This prevents tests from accidentally hitting a production
+// Dolt server — tests MUST run against the isolated test server started by
+// TestMain in testmain_test.go.
 func skipIfNoDolt(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("dolt"); err != nil {
 		t.Skip("Dolt not installed, skipping test")
+	}
+	if testServerPort == 0 {
+		t.Skip("Test Dolt server not running, skipping test")
 	}
 }
 
@@ -208,6 +213,98 @@ func TestDoltStoreConfig(t *testing.T) {
 	}
 	if value != "" {
 		t.Errorf("expected empty value after delete, got %q", value)
+	}
+}
+
+// TestSetConfigNormalizesIssuePrefix verifies that SetConfig strips trailing
+// hyphens from issue_prefix to prevent double-hyphen bead IDs (bd-6uly).
+func TestSetConfigNormalizesIssuePrefix(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Set prefix WITH trailing hyphen — should be normalized
+	if err := store.SetConfig(ctx, "issue_prefix", "gt-"); err != nil {
+		t.Fatalf("SetConfig failed: %v", err)
+	}
+
+	value, err := store.GetConfig(ctx, "issue_prefix")
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if value != "gt" {
+		t.Errorf("expected issue_prefix 'gt' (trailing hyphen stripped), got %q", value)
+	}
+}
+
+// TestCreateIssueNoDoubleHyphen verifies that issue IDs don't get double
+// hyphens even if the DB somehow has a trailing-hyphen prefix (bd-6uly).
+func TestCreateIssueNoDoubleHyphen(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Bypass SetConfig normalization: write trailing-hyphen prefix directly to DB
+	_, err := store.db.ExecContext(ctx, "UPDATE config SET value = ? WHERE `key` = ?", "gt-", "issue_prefix")
+	if err != nil {
+		t.Fatalf("failed to set raw prefix: %v", err)
+	}
+
+	issue := &types.Issue{
+		Title:     "test double hyphen",
+		Status:    types.StatusOpen,
+		Priority:  3,
+		IssueType: types.TypeBug,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-user"); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	// ID should start with "gt-" not "gt--"
+	if strings.Contains(issue.ID, "--") {
+		t.Errorf("issue ID contains double hyphen: %q", issue.ID)
+	}
+	if !strings.HasPrefix(issue.ID, "gt-") {
+		t.Errorf("issue ID should start with 'gt-', got %q", issue.ID)
+	}
+}
+
+// TestCreateWispNoDoubleHyphen verifies that wisp IDs don't get double
+// hyphens even if the DB has a trailing-hyphen prefix (bd-6uly).
+func TestCreateWispNoDoubleHyphen(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Bypass SetConfig normalization: write trailing-hyphen prefix directly to DB
+	_, err := store.db.ExecContext(ctx, "UPDATE config SET value = ? WHERE `key` = ?", "gt-", "issue_prefix")
+	if err != nil {
+		t.Fatalf("failed to set raw prefix: %v", err)
+	}
+
+	wisp := &types.Issue{
+		Title:     "test wisp double hyphen",
+		Status:    types.StatusOpen,
+		Priority:  3,
+		IssueType: types.TypeBug,
+		Ephemeral: true,
+	}
+	if err := store.createWisp(ctx, wisp, "test-user"); err != nil {
+		t.Fatalf("createWisp failed: %v", err)
+	}
+
+	// Wisp ID should contain "gt-wisp-" not "gt--wisp-"
+	if strings.Contains(wisp.ID, "--") {
+		t.Errorf("wisp ID contains double hyphen: %q", wisp.ID)
+	}
+	if !strings.HasPrefix(wisp.ID, "gt-wisp-") {
+		t.Errorf("wisp ID should start with 'gt-wisp-', got %q", wisp.ID)
 	}
 }
 
@@ -1449,6 +1546,115 @@ func TestDoltStoreGetReadyWork(t *testing.T) {
 	}
 }
 
+func TestDoltStoreGetReadyWorkWaitsForChildrenOfSpawner(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping slow Dolt integration test in short mode")
+	}
+
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	implement := &types.Issue{
+		ID:        "test-implement",
+		Title:     "Implement",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	review := &types.Issue{
+		ID:        "test-review",
+		Title:     "Review",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	otherSpawner := &types.Issue{
+		ID:        "test-other-spawner",
+		Title:     "Other spawner",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	implChild := &types.Issue{
+		ID:        "test-implement.1",
+		Title:     "Implement child",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	otherChild := &types.Issue{
+		ID:        "test-other-spawner.1",
+		Title:     "Unrelated child",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+
+	for _, issue := range []*types.Issue{implement, review, otherSpawner, implChild, otherChild} {
+		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("failed to create issue %s: %v", issue.ID, err)
+		}
+	}
+
+	for _, dep := range []*types.Dependency{
+		{IssueID: implChild.ID, DependsOnID: implement.ID, Type: types.DepParentChild},
+		{IssueID: otherChild.ID, DependsOnID: otherSpawner.ID, Type: types.DepParentChild},
+	} {
+		if err := store.AddDependency(ctx, dep, "tester"); err != nil {
+			t.Fatalf("failed to add parent-child dependency %s -> %s: %v", dep.IssueID, dep.DependsOnID, err)
+		}
+	}
+
+	metaJSON, err := json.Marshal(types.WaitsForMeta{Gate: types.WaitsForAllChildren})
+	if err != nil {
+		t.Fatalf("failed to marshal waits-for metadata: %v", err)
+	}
+	if err := store.AddDependency(ctx, &types.Dependency{
+		IssueID:     review.ID,
+		DependsOnID: implement.ID,
+		Type:        types.DepWaitsFor,
+		Metadata:    string(metaJSON),
+	}, "tester"); err != nil {
+		t.Fatalf("failed to add waits-for dependency: %v", err)
+	}
+
+	hasReadyID := func(issues []*types.Issue, id string) bool {
+		for _, issue := range issues {
+			if issue.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("blocked-before-child-close", func(t *testing.T) {
+		readyBefore, err := store.GetReadyWork(ctx, types.WorkFilter{})
+		if err != nil {
+			t.Fatalf("failed to get ready work (before close): %v", err)
+		}
+		if hasReadyID(readyBefore, review.ID) {
+			t.Fatalf("expected %s to be blocked by open child of %s", review.ID, implement.ID)
+		}
+	})
+
+	t.Run("ready-after-child-close", func(t *testing.T) {
+		if err := store.CloseIssue(ctx, implChild.ID, "done", "tester", "session-test"); err != nil {
+			t.Fatalf("failed to close child issue: %v", err)
+		}
+
+		readyAfter, err := store.GetReadyWork(ctx, types.WorkFilter{})
+		if err != nil {
+			t.Fatalf("failed to get ready work (after close): %v", err)
+		}
+		if !hasReadyID(readyAfter, review.ID) {
+			t.Fatalf("expected %s to become ready after children of %s close", review.ID, implement.ID)
+		}
+	})
+}
+
 // TestCloseWithTimeout tests the close timeout helper function
 func TestCloseWithTimeout(t *testing.T) {
 	// Test 1: Fast close succeeds
@@ -1618,5 +1824,115 @@ func assertOrder(t *testing.T, ids []string, expected ...string) {
 	}
 	if pos != len(expected) {
 		t.Errorf("expected order %v but got %v (matched %d of %d)", expected, ids, pos, len(expected))
+	}
+}
+
+// TestEphemeralExplicitID_GetIssue verifies that GetIssue finds ephemeral beads
+// created with explicit (non-wisp) IDs. Regression test for GH#2053.
+func TestEphemeralExplicitID_GetIssue(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Create an ephemeral bead with an explicit ID (no -wisp- in name)
+	issue := &types.Issue{
+		ID:        "test-agent-emma",
+		Title:     "Agent: test-agent-emma",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-user"); err != nil {
+		t.Fatalf("CreateIssue (ephemeral with explicit ID) failed: %v", err)
+	}
+
+	// GetIssue should find it (this was the GH#2053 bug)
+	got, err := store.GetIssue(ctx, "test-agent-emma")
+	if err != nil {
+		t.Fatalf("GetIssue failed for ephemeral bead with explicit ID: %v", err)
+	}
+	if got.ID != "test-agent-emma" {
+		t.Errorf("Expected ID %q, got %q", "test-agent-emma", got.ID)
+	}
+	if !got.Ephemeral {
+		t.Error("Expected Ephemeral=true")
+	}
+}
+
+// TestEphemeralExplicitID_UpdateIssue verifies that UpdateIssue works on
+// ephemeral beads created with explicit IDs. Regression test for GH#2053.
+func TestEphemeralExplicitID_UpdateIssue(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	issue := &types.Issue{
+		ID:        "test-agent-max",
+		Title:     "Agent: test-agent-max",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-user"); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	// UpdateIssue should work (this was broken per GH#2053)
+	updates := map[string]interface{}{
+		"agent_state": "running",
+	}
+	if err := store.UpdateIssue(ctx, "test-agent-max", updates, "test-user"); err != nil {
+		t.Fatalf("UpdateIssue failed for ephemeral bead with explicit ID: %v", err)
+	}
+
+	// Verify the update persisted
+	got, err := store.GetIssue(ctx, "test-agent-max")
+	if err != nil {
+		t.Fatalf("GetIssue after update failed: %v", err)
+	}
+	if got.AgentState != "running" {
+		t.Errorf("Expected agent_state %q, got %q", "running", got.AgentState)
+	}
+}
+
+// TestEphemeralExplicitID_SearchIssues verifies that SearchIssues finds
+// ephemeral beads with explicit IDs (this already worked pre-fix via wisp merge).
+func TestEphemeralExplicitID_SearchIssues(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	issue := &types.Issue{
+		ID:        "test-agent-furiosa",
+		Title:     "Agent: test-agent-furiosa",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-user"); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	// SearchIssues with nil Ephemeral filter should find it (merges wisps)
+	results, err := store.SearchIssues(ctx, "", types.IssueFilter{
+		IDs: []string{"test-agent-furiosa"},
+	})
+	if err != nil {
+		t.Fatalf("SearchIssues failed: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("Expected 1 result, got %d", len(results))
+	}
+	if results[0].ID != "test-agent-furiosa" {
+		t.Errorf("Expected ID %q, got %q", "test-agent-furiosa", results[0].ID)
 	}
 }

@@ -18,6 +18,15 @@ type doltTransaction struct {
 	store *DoltStore
 }
 
+// isActiveWisp checks if an ID exists in the wisps table within the transaction.
+// Unlike the store-level isActiveWisp, this queries within the transaction so it
+// sees uncommitted wisps. Handles both -wisp- pattern and explicit-ID ephemerals (GH#2053).
+func (t *doltTransaction) isActiveWisp(ctx context.Context, id string) bool {
+	var exists int
+	err := t.tx.QueryRowContext(ctx, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1", id).Scan(&exists)
+	return err == nil
+}
+
 // CreateIssueImport is the import-friendly issue creation hook.
 // Dolt does not enforce prefix validation at the storage layer, so this delegates to CreateIssue.
 func (t *doltTransaction) CreateIssueImport(ctx context.Context, issue *types.Issue, actor string, skipPrefixValidation bool) error {
@@ -25,12 +34,16 @@ func (t *doltTransaction) CreateIssueImport(ctx context.Context, issue *types.Is
 }
 
 // RunInTransaction executes a function within a database transaction.
+// The commitMsg is used for the DOLT_COMMIT that occurs inside the transaction,
+// making the write atomically visible in Dolt's version history.
 // Wisp routing is handled within individual transaction methods based on ID/Ephemeral flag.
-func (s *DoltStore) RunInTransaction(ctx context.Context, fn func(tx storage.Transaction) error) error {
-	return s.runDoltTransaction(ctx, fn)
+func (s *DoltStore) RunInTransaction(ctx context.Context, commitMsg string, fn func(tx storage.Transaction) error) error {
+	return s.withRetry(ctx, func() error {
+		return s.runDoltTransaction(ctx, commitMsg, fn)
+	})
 }
 
-func (s *DoltStore) runDoltTransaction(ctx context.Context, fn func(tx storage.Transaction) error) error {
+func (s *DoltStore) runDoltTransaction(ctx context.Context, commitMsg string, fn func(tx storage.Transaction) error) error {
 	sqlTx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -50,7 +63,33 @@ func (s *DoltStore) runDoltTransaction(ctx context.Context, fn func(tx storage.T
 		return err
 	}
 
+	// DOLT_COMMIT ends the SQL transaction implicitly — no tx.Commit() needed after.
+	// Calling tx.Commit() after DOLT_COMMIT can cause connection state issues under
+	// concurrent load (the transaction is already closed by Dolt).
+	if commitMsg != "" {
+		_, err := sqlTx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+			commitMsg, s.commitAuthorString())
+		if err != nil && !isDoltNothingToCommit(err) {
+			_ = sqlTx.Rollback()
+			return fmt.Errorf("dolt commit: %w", err)
+		}
+		// DOLT_COMMIT already ended the transaction; do not call tx.Commit().
+		return nil
+	}
+
+	// No dolt commit requested — commit the SQL transaction normally.
 	return sqlTx.Commit()
+}
+
+// isDoltNothingToCommit returns true if the error indicates there were no
+// staged changes for Dolt to commit — a benign condition.
+func isDoltNothingToCommit(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "nothing to commit") ||
+		(strings.Contains(s, "no changes") && strings.Contains(s, "commit"))
 }
 
 // CreateIssue creates an issue within the transaction.
@@ -115,10 +154,10 @@ func (t *doltTransaction) CreateIssues(ctx context.Context, issues []*types.Issu
 }
 
 // GetIssue retrieves an issue within the transaction.
-// Checks wisps table for ephemeral IDs.
+// Checks wisps table for active wisps (including explicit-ID ephemerals).
 func (t *doltTransaction) GetIssue(ctx context.Context, id string) (*types.Issue, error) {
 	table := "issues"
-	if IsEphemeralID(id) {
+	if t.isActiveWisp(ctx, id) {
 		table = "wisps"
 	}
 	return scanIssueTxFromTable(ctx, t.tx, table, id)
@@ -205,7 +244,7 @@ func (t *doltTransaction) SearchIssues(ctx context.Context, query string, filter
 // UpdateIssue updates an issue within the transaction
 func (t *doltTransaction) UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error {
 	table := "issues"
-	if IsEphemeralID(id) {
+	if t.isActiveWisp(ctx, id) {
 		table = "wisps"
 	}
 
@@ -248,7 +287,7 @@ func (t *doltTransaction) UpdateIssue(ctx context.Context, id string, updates ma
 // CloseIssue closes an issue within the transaction
 func (t *doltTransaction) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
 	table := "issues"
-	if IsEphemeralID(id) {
+	if t.isActiveWisp(ctx, id) {
 		table = "wisps"
 	}
 
@@ -264,7 +303,7 @@ func (t *doltTransaction) CloseIssue(ctx context.Context, id string, reason stri
 // DeleteIssue deletes an issue within the transaction
 func (t *doltTransaction) DeleteIssue(ctx context.Context, id string) error {
 	table := "issues"
-	if IsEphemeralID(id) {
+	if t.isActiveWisp(ctx, id) {
 		table = "wisps"
 	}
 
@@ -276,7 +315,7 @@ func (t *doltTransaction) DeleteIssue(ctx context.Context, id string) error {
 // AddDependency adds a dependency within the transaction
 func (t *doltTransaction) AddDependency(ctx context.Context, dep *types.Dependency, actor string) error {
 	table := "dependencies"
-	if IsEphemeralID(dep.IssueID) {
+	if t.isActiveWisp(ctx, dep.IssueID) {
 		table = "wisp_dependencies"
 	}
 
@@ -291,7 +330,7 @@ func (t *doltTransaction) AddDependency(ctx context.Context, dep *types.Dependen
 
 func (t *doltTransaction) GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error) {
 	table := "dependencies"
-	if IsEphemeralID(issueID) {
+	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_dependencies"
 	}
 
@@ -328,7 +367,7 @@ func (t *doltTransaction) GetDependencyRecords(ctx context.Context, issueID stri
 // RemoveDependency removes a dependency within the transaction
 func (t *doltTransaction) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
 	table := "dependencies"
-	if IsEphemeralID(issueID) {
+	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_dependencies"
 	}
 
@@ -342,7 +381,7 @@ func (t *doltTransaction) RemoveDependency(ctx context.Context, issueID, depends
 // AddLabel adds a label within the transaction
 func (t *doltTransaction) AddLabel(ctx context.Context, issueID, label, actor string) error {
 	table := "labels"
-	if IsEphemeralID(issueID) {
+	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_labels"
 	}
 
@@ -355,7 +394,7 @@ func (t *doltTransaction) AddLabel(ctx context.Context, issueID, label, actor st
 
 func (t *doltTransaction) GetLabels(ctx context.Context, issueID string) ([]string, error) {
 	table := "labels"
-	if IsEphemeralID(issueID) {
+	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_labels"
 	}
 
@@ -379,7 +418,7 @@ func (t *doltTransaction) GetLabels(ctx context.Context, issueID string) ([]stri
 // RemoveLabel removes a label within the transaction
 func (t *doltTransaction) RemoveLabel(ctx context.Context, issueID, label, actor string) error {
 	table := "labels"
-	if IsEphemeralID(issueID) {
+	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_labels"
 	}
 
@@ -435,7 +474,7 @@ func (t *doltTransaction) ImportIssueComment(ctx context.Context, issueID, autho
 	}
 
 	table := "comments"
-	if IsEphemeralID(issueID) {
+	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_comments"
 	}
 
@@ -458,7 +497,7 @@ func (t *doltTransaction) ImportIssueComment(ctx context.Context, issueID, autho
 
 func (t *doltTransaction) GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error) {
 	table := "comments"
-	if IsEphemeralID(issueID) {
+	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_comments"
 	}
 
@@ -487,7 +526,7 @@ func (t *doltTransaction) GetIssueComments(ctx context.Context, issueID string) 
 // AddComment adds a comment within the transaction
 func (t *doltTransaction) AddComment(ctx context.Context, issueID, actor, comment string) error {
 	table := "events"
-	if IsEphemeralID(issueID) {
+	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_events"
 	}
 

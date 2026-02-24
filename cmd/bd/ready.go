@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -106,6 +108,33 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		if molType != nil {
 			filter.MolType = molType
 		}
+
+		// Metadata filters (GH#1406)
+		metadataFieldFlags, _ := cmd.Flags().GetStringArray("metadata-field")
+		if len(metadataFieldFlags) > 0 {
+			filter.MetadataFields = make(map[string]string, len(metadataFieldFlags))
+			for _, mf := range metadataFieldFlags {
+				k, v, ok := strings.Cut(mf, "=")
+				if !ok || k == "" {
+					fmt.Fprintf(os.Stderr, "Error: invalid --metadata-field: expected key=value, got %q\n", mf)
+					os.Exit(1)
+				}
+				if err := storage.ValidateMetadataKey(k); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: invalid --metadata-field key: %v\n", err)
+					os.Exit(1)
+				}
+				filter.MetadataFields[k] = v
+			}
+		}
+		hasMetadataKey, _ := cmd.Flags().GetString("has-metadata-key")
+		if hasMetadataKey != "" {
+			if err := storage.ValidateMetadataKey(hasMetadataKey); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid --has-metadata-key: %v\n", err)
+				os.Exit(1)
+			}
+			filter.HasMetadataKey = hasMetadataKey
+		}
+
 		// Validate sort policy
 		if !filter.SortPolicy.IsValid() {
 			FatalError("invalid sort policy '%s'. Valid values: hybrid, priority, oldest", sortPolicy)
@@ -138,12 +167,39 @@ This is useful for agents executing molecules to see which steps can run next.`,
 			for i, issue := range issues {
 				issueIDs[i] = issue.ID
 			}
-			commentCounts, _ := activeStore.GetCommentCounts(ctx, issueIDs) // Best effort: comment counts are supplementary display info
+			// Best effort: display gracefully degrades with empty data
+			labelsMap, _ := activeStore.GetLabelsForIssues(ctx, issueIDs)
+			depCounts, _ := activeStore.GetDependencyCounts(ctx, issueIDs)
+			allDeps, _ := activeStore.GetDependencyRecordsForIssues(ctx, issueIDs)
+			commentCounts, _ := activeStore.GetCommentCounts(ctx, issueIDs)
+
+			// Populate labels and dependencies for JSON output
+			for _, issue := range issues {
+				issue.Labels = labelsMap[issue.ID]
+				issue.Dependencies = allDeps[issue.ID]
+			}
+
+			// Build response with counts + computed parent (consistent with bd list --json)
 			issuesWithCounts := make([]*types.IssueWithCounts, len(issues))
 			for i, issue := range issues {
+				counts := depCounts[issue.ID]
+				if counts == nil {
+					counts = &types.DependencyCounts{DependencyCount: 0, DependentCount: 0}
+				}
+				// Compute parent from dependency records
+				var parent *string
+				for _, dep := range allDeps[issue.ID] {
+					if dep.Type == types.DepParentChild {
+						parent = &dep.DependsOnID
+						break
+					}
+				}
 				issuesWithCounts[i] = &types.IssueWithCounts{
-					Issue:        issue,
-					CommentCount: commentCounts[issue.ID],
+					Issue:           issue,
+					DependencyCount: counts.DependencyCount,
+					DependentCount:  counts.DependentCount,
+					CommentCount:    commentCounts[issue.ID],
+					Parent:          parent,
 				}
 			}
 			outputJSON(issuesWithCounts)
@@ -475,6 +531,9 @@ func init() {
 	readyCmd.Flags().Bool("include-ephemeral", false, "Include ephemeral issues (wisps) in results")
 	readyCmd.Flags().Bool("gated", false, "Find molecules ready for gate-resume dispatch")
 	readyCmd.Flags().String("rig", "", "Query a different rig's database (e.g., --rig gastown, --rig gt-, --rig gt)")
+	// Metadata filtering (GH#1406)
+	readyCmd.Flags().StringArray("metadata-field", nil, "Filter by metadata field (key=value, repeatable)")
+	readyCmd.Flags().String("has-metadata-key", "", "Filter issues that have this metadata key set")
 	rootCmd.AddCommand(readyCmd)
 	blockedCmd.Flags().String("parent", "", "Filter to descendants of this bead/epic")
 	rootCmd.AddCommand(blockedCmd)

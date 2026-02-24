@@ -81,6 +81,9 @@ func (s *DoltStore) CreateIssue(ctx context.Context, issue *types.Issue, actor s
 		return fmt.Errorf("failed to get config: %w", err)
 	}
 
+	// Normalize prefix: strip trailing hyphen to prevent double-hyphen IDs (bd-6uly)
+	configPrefix = strings.TrimSuffix(configPrefix, "-")
+
 	// Determine prefix for ID generation
 	prefix := configPrefix
 	if issue.PrefixOverride != "" {
@@ -106,6 +109,13 @@ func (s *DoltStore) CreateIssue(ctx context.Context, issue *types.Issue, actor s
 	// Record creation event
 	if err := recordEvent(ctx, tx, issue.ID, types.EventCreated, actor, "", ""); err != nil {
 		return fmt.Errorf("failed to record creation event: %w", err)
+	}
+
+	// DOLT_COMMIT inside transaction — atomic with the writes
+	commitMsg := fmt.Sprintf("bd: create %s", issue.ID)
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("dolt commit: %w", err)
 	}
 
 	return tx.Commit()
@@ -226,15 +236,30 @@ func (s *DoltStore) CreateIssuesWithFullOptions(ctx context.Context, issues []*t
 			}
 		}
 
+		// Check if issue already exists before inserting (GH#2061).
+		// insertIssue uses ON DUPLICATE KEY UPDATE, so the INSERT always succeeds,
+		// but we need to know whether it was a create or an update to avoid
+		// recording redundant "created" events on re-import.
+		var existingCount int
+		if issue.ID != "" {
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM issues WHERE id = ?`, issue.ID).Scan(&existingCount); err != nil {
+				return fmt.Errorf("failed to check issue existence for %s: %w", issue.ID, err)
+			}
+		}
+
 		if err := insertIssue(ctx, tx, issue); err != nil {
 			return fmt.Errorf("failed to insert issue %s: %w", issue.ID, err)
 		}
-		if err := recordEvent(ctx, tx, issue.ID, types.EventCreated, actor, "", ""); err != nil {
-			return fmt.Errorf("failed to record event for %s: %w", issue.ID, err)
+
+		// Only record "created" event for genuinely new issues (not upserts).
+		if existingCount == 0 {
+			if err := recordEvent(ctx, tx, issue.ID, types.EventCreated, actor, "", ""); err != nil {
+				return fmt.Errorf("failed to record event for %s: %w", issue.ID, err)
+			}
 		}
 
 		// Persist labels from the issue struct into the labels table (GH#1844).
-		// Without this, labels parsed from JSONL are silently dropped on import.
+		// Without this, labels from the issue struct are silently dropped on import.
 		for _, label := range issue.Labels {
 			_, err := tx.ExecContext(ctx, `
 				INSERT INTO labels (issue_id, label)
@@ -247,6 +272,7 @@ func (s *DoltStore) CreateIssuesWithFullOptions(ctx context.Context, issues []*t
 		}
 
 		// Persist comments from the issue struct into the comments table (GH#1844).
+		// Use ON DUPLICATE KEY UPDATE to handle re-imports gracefully (GH#2061).
 		for _, comment := range issue.Comments {
 			createdAt := comment.CreatedAt
 			if createdAt.IsZero() {
@@ -255,6 +281,7 @@ func (s *DoltStore) CreateIssuesWithFullOptions(ctx context.Context, issues []*t
 			_, err := tx.ExecContext(ctx, `
 				INSERT INTO comments (issue_id, author, text, created_at)
 				VALUES (?, ?, ?, ?)
+				ON DUPLICATE KEY UPDATE text = VALUES(text)
 			`, issue.ID, comment.Author, comment.Text, createdAt)
 			if err != nil {
 				return fmt.Errorf("failed to insert comment for %s: %w", issue.ID, err)
@@ -283,6 +310,13 @@ func (s *DoltStore) CreateIssuesWithFullOptions(ctx context.Context, issues []*t
 				return fmt.Errorf("failed to insert dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
 			}
 		}
+	}
+
+	// DOLT_COMMIT inside transaction — atomic with the writes
+	commitMsg := fmt.Sprintf("bd: create %d issue(s)", len(issues))
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("dolt commit: %w", err)
 	}
 
 	return tx.Commit()
@@ -366,7 +400,14 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 		return s.updateWisp(ctx, id, updates, actor)
 	}
 
-	oldIssue, err := s.GetIssue(ctx, id)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // No-op after successful commit
+
+	// Read inside transaction to avoid TOCTOU race
+	oldIssue, err := scanIssueTxFromTable(ctx, tx, "issues", id)
 	if err != nil {
 		return fmt.Errorf("failed to get issue for update: %w", err)
 	}
@@ -407,12 +448,6 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 
 	args = append(args, id)
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }() // No-op after successful commit
-
 	// nolint:gosec // G201: setClauses contains only column names (e.g. "status = ?"), actual values passed via args
 	query := fmt.Sprintf("UPDATE issues SET %s WHERE id = ?", strings.Join(setClauses, ", "))
 	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
@@ -428,7 +463,21 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 		return fmt.Errorf("failed to record event: %w", err)
 	}
 
-	return tx.Commit()
+	// DOLT_COMMIT inside transaction — atomic with the writes
+	commitMsg := fmt.Sprintf("bd: update %s", id)
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("dolt commit: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Status changes affect the active set used by blocked ID computation
+	if _, hasStatus := updates["status"]; hasStatus {
+		s.invalidateBlockedIDsCache()
+	}
+	return nil
 }
 
 // ClaimIssue atomically claims an issue using compare-and-swap semantics.
@@ -440,18 +489,19 @@ func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) err
 		return s.claimWisp(ctx, id, actor)
 	}
 
-	oldIssue, err := s.GetIssue(ctx, id)
-	if err != nil {
-		return fmt.Errorf("failed to get issue for claim: %w", err)
-	}
-
-	now := time.Now().UTC()
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // No-op after successful commit
+
+	// Read inside transaction for consistent snapshot
+	oldIssue, err := scanIssueTxFromTable(ctx, tx, "issues", id)
+	if err != nil {
+		return fmt.Errorf("failed to get issue for claim: %w", err)
+	}
+
+	now := time.Now().UTC()
 
 	// Use conditional UPDATE with WHERE clause to ensure atomicity.
 	// The UPDATE only succeeds if assignee is currently empty.
@@ -470,10 +520,9 @@ func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) err
 	}
 
 	if rowsAffected == 0 {
-		// The UPDATE didn't affect any rows, which means the assignee was not empty.
-		// Query to find out who has it claimed.
+		// Query current assignee inside the same transaction for consistency.
 		var currentAssignee string
-		err := s.db.QueryRowContext(ctx, `SELECT assignee FROM issues WHERE id = ?`, id).Scan(&currentAssignee)
+		err := tx.QueryRowContext(ctx, `SELECT assignee FROM issues WHERE id = ?`, id).Scan(&currentAssignee)
 		if err != nil {
 			return fmt.Errorf("failed to get current assignee: %w", err)
 		}
@@ -492,7 +541,19 @@ func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) err
 		return fmt.Errorf("failed to record claim event: %w", err)
 	}
 
-	return tx.Commit()
+	// DOLT_COMMIT inside transaction — atomic with the writes
+	commitMsg := fmt.Sprintf("bd: claim %s", id)
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("dolt commit: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Claiming changes status to in_progress, affecting blocked ID computation
+	s.invalidateBlockedIDsCache()
+	return nil
 }
 
 // CloseIssue closes an issue with a reason
@@ -530,7 +591,19 @@ func (s *DoltStore) CloseIssue(ctx context.Context, id string, reason string, ac
 		return fmt.Errorf("failed to record event: %w", err)
 	}
 
-	return tx.Commit()
+	// DOLT_COMMIT inside transaction — atomic with the writes
+	commitMsg := fmt.Sprintf("bd: close %s", id)
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("dolt commit: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Closing changes the active set, which affects blocked ID computation (GH#1495)
+	s.invalidateBlockedIDsCache()
+	return nil
 }
 
 // DeleteIssue permanently removes an issue
@@ -577,6 +650,13 @@ func (s *DoltStore) DeleteIssue(ctx context.Context, id string) error {
 		return fmt.Errorf("issue not found: %s", id)
 	}
 
+	// DOLT_COMMIT inside transaction — atomic with the writes
+	commitMsg := fmt.Sprintf("bd: delete %s", id)
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("dolt commit: %w", err)
+	}
+
 	return tx.Commit()
 }
 
@@ -595,7 +675,7 @@ func (s *DoltStore) DeleteIssues(ctx context.Context, ids []string, cascade bool
 	}
 
 	// Route wisp IDs to wisp deletion; process regular IDs in batch below.
-	ephIDs, regularIDs := partitionIDs(ids)
+	ephIDs, regularIDs := s.partitionByWispStatus(ctx, ids)
 	wispDeleteCount := 0
 	for _, eid := range ephIDs {
 		if s.isActiveWisp(ctx, eid) {
@@ -813,6 +893,13 @@ func (s *DoltStore) DeleteIssues(ctx context.Context, ids []string, cascade bool
 	}
 	result.DeletedCount = totalDeleted + wispDeleteCount
 
+	// DOLT_COMMIT inside transaction — atomic with the writes
+	commitMsg := fmt.Sprintf("bd: delete %d issue(s)", totalDeleted)
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return nil, fmt.Errorf("dolt commit: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
@@ -959,6 +1046,24 @@ func insertIssue(ctx context.Context, tx *sql.Tx, issue *types.Issue) error {
 			?, ?, ?, ?, ?, ?,
 			?, ?, ?
 		)
+		ON DUPLICATE KEY UPDATE
+			content_hash = VALUES(content_hash),
+			title = VALUES(title),
+			description = VALUES(description),
+			design = VALUES(design),
+			acceptance_criteria = VALUES(acceptance_criteria),
+			notes = VALUES(notes),
+			status = VALUES(status),
+			priority = VALUES(priority),
+			issue_type = VALUES(issue_type),
+			assignee = VALUES(assignee),
+			estimated_minutes = VALUES(estimated_minutes),
+			updated_at = VALUES(updated_at),
+			closed_at = VALUES(closed_at),
+			external_ref = VALUES(external_ref),
+			source_repo = VALUES(source_repo),
+			close_reason = VALUES(close_reason),
+			metadata = VALUES(metadata)
 	`,
 		issue.ID, issue.ContentHash, issue.Title, issue.Description, issue.Design, issue.AcceptanceCriteria, issue.Notes,
 		issue.Status, issue.Priority, issue.IssueType, nullString(issue.Assignee), nullInt(issue.EstimatedMinutes),
@@ -999,9 +1104,126 @@ func recordEvent(ctx context.Context, tx *sql.Tx, issueID string, eventType type
 	return err
 }
 
-// generateIssueID generates a unique hash-based ID for an issue
-// Uses adaptive length based on database size and tries multiple nonces on collision
+// seedCounterFromExistingIssuesTx scans existing issues to find the highest numeric suffix
+// for the given prefix, then seeds the issue_counter table if no row exists yet.
+// This is called when counter mode is first enabled on a repo that already has issues,
+// to prevent counter collisions with manually-created sequential IDs (GH#2002).
+// It is idempotent: if a counter row already exists for this prefix, it does nothing.
+func seedCounterFromExistingIssuesTx(ctx context.Context, tx *sql.Tx, prefix string) error {
+	// Check whether a counter row already exists for this prefix.
+	// If it does, we must not overwrite it (the counter may already be in use).
+	var existing int
+	err := tx.QueryRowContext(ctx, "SELECT last_id FROM issue_counter WHERE prefix = ?", prefix).Scan(&existing)
+	if err == nil {
+		// Row exists - counter is already initialized, nothing to do.
+		return nil
+	}
+	if err != sql.ErrNoRows {
+		return fmt.Errorf("failed to check issue_counter for prefix %q: %w", prefix, err)
+	}
+
+	// No counter row yet. Scan existing issues to find the highest numeric suffix.
+	likePattern := prefix + "-%"
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM issues WHERE id LIKE ?", likePattern)
+	if err != nil {
+		return fmt.Errorf("failed to query existing issues for prefix %q: %w", prefix, err)
+	}
+	defer rows.Close()
+
+	maxNum := 0
+	prefixDash := prefix + "-"
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("failed to scan issue id: %w", err)
+		}
+		// Strip the prefix and attempt to parse the remainder as an integer.
+		suffix := strings.TrimPrefix(id, prefixDash)
+		if suffix == id {
+			// id did not start with prefix- (should not happen given LIKE, but be safe)
+			continue
+		}
+		var num int
+		if _, parseErr := fmt.Sscanf(suffix, "%d", &num); parseErr == nil && fmt.Sprintf("%d", num) == suffix {
+			if num > maxNum {
+				maxNum = num
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate existing issues for prefix %q: %w", prefix, err)
+	}
+
+	// Only insert a seed row if we found at least one numeric ID.
+	// If no numeric IDs exist, the counter will naturally start at 1 on first use.
+	if maxNum > 0 {
+		_, err = tx.ExecContext(ctx,
+			"INSERT INTO issue_counter (prefix, last_id) VALUES (?, ?)",
+			prefix, maxNum)
+		if err != nil {
+			return fmt.Errorf("failed to seed issue_counter for prefix %q at %d: %w", prefix, maxNum, err)
+		}
+	}
+
+	return nil
+}
+
+// nextCounterIDTx increments and returns the next sequential issue ID for the
+// given prefix within an existing transaction. Returns the full ID string
+// (e.g., "bd-1"). Used by both generateIssueID and generateIssueIDInTable.
+func nextCounterIDTx(ctx context.Context, tx *sql.Tx, prefix string) (string, error) {
+	var lastID int
+	err := tx.QueryRowContext(ctx, "SELECT last_id FROM issue_counter WHERE prefix = ?", prefix).Scan(&lastID)
+	if err == sql.ErrNoRows {
+		// No counter row yet - seed from existing issues before proceeding.
+		if seedErr := seedCounterFromExistingIssuesTx(ctx, tx, prefix); seedErr != nil {
+			return "", fmt.Errorf("failed to seed issue counter for prefix %q: %w", prefix, seedErr)
+		}
+		// Re-read the (possibly just-seeded) counter value.
+		err = tx.QueryRowContext(ctx, "SELECT last_id FROM issue_counter WHERE prefix = ?", prefix).Scan(&lastID)
+		if err != nil && err != sql.ErrNoRows {
+			return "", fmt.Errorf("failed to read issue counter after seeding for prefix %q: %w", prefix, err)
+		}
+		if err == sql.ErrNoRows {
+			lastID = 0
+		}
+	} else if err != nil {
+		return "", fmt.Errorf("failed to read issue counter for prefix %q: %w", prefix, err)
+	}
+	nextID := lastID + 1
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO issue_counter (prefix, last_id) VALUES (?, ?)
+		ON DUPLICATE KEY UPDATE last_id = ?
+	`, prefix, nextID, nextID)
+	if err != nil {
+		return "", fmt.Errorf("failed to update issue counter for prefix %q: %w", prefix, err)
+	}
+	return fmt.Sprintf("%s-%d", prefix, nextID), nil
+}
+
+// isCounterModeTx checks whether issue_id_mode=counter is configured.
+func isCounterModeTx(ctx context.Context, tx *sql.Tx) (bool, error) {
+	var idMode string
+	err := tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", "issue_id_mode").Scan(&idMode)
+	if err != nil && err != sql.ErrNoRows {
+		return false, fmt.Errorf("failed to read issue_id_mode config: %w", err)
+	}
+	return idMode == "counter", nil
+}
+
+// generateIssueID generates a unique ID for an issue.
+// If issue_id_mode=counter is configured, generates sequential IDs (bd-1, bd-2, ...).
+// Otherwise uses the default hash-based ID generation.
 func generateIssueID(ctx context.Context, tx *sql.Tx, prefix string, issue *types.Issue, actor string) (string, error) {
+	counterMode, err := isCounterModeTx(ctx, tx)
+	if err != nil {
+		return "", err
+	}
+	if counterMode {
+		return nextCounterIDTx(ctx, tx, prefix)
+	}
+
+	// Default hash-based ID generation
 	// Get adaptive base length based on current database size
 	baseLength, err := GetAdaptiveIDLengthTx(ctx, tx, prefix)
 	if err != nil {
@@ -1137,13 +1359,20 @@ func nullIntVal(i int) interface{} {
 	return i
 }
 
-// jsonMetadata returns the metadata as a string, or "{}" if empty.
-// Dolt's JSON column type requires valid JSON, so we can't insert empty strings.
+// jsonMetadata returns the metadata as a validated JSON string, or "{}" if empty.
+// Dolt's JSON column type requires valid JSON, so we normalize nil/empty to "{}"
+// and validate that non-empty metadata is well-formed JSON.
 func jsonMetadata(m []byte) string {
 	if len(m) == 0 {
 		return "{}"
 	}
-	return string(m)
+	s := string(m)
+	if !json.Valid(m) {
+		// Fall back to empty object for invalid JSON rather than storing garbage
+		_, _ = fmt.Fprintf(os.Stderr, "Warning: invalid JSON metadata, using empty object\n")
+		return "{}"
+	}
+	return s
 }
 
 func parseJSONStringArray(s string) []string {
@@ -1259,6 +1488,32 @@ func (s *DoltStore) ClearRepoMtime(ctx context.Context, repoPath string) error {
 	}
 
 	return nil
+}
+
+// GetRepoMtime returns the cached mtime (in nanoseconds) for a repository's data file.
+// Returns 0 if no cache entry exists.
+func (s *DoltStore) GetRepoMtime(ctx context.Context, repoPath string) (int64, error) {
+	var mtimeNs int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT mtime_ns FROM repo_mtimes WHERE repo_path = ?`, repoPath,
+	).Scan(&mtimeNs)
+	if err != nil {
+		return 0, nil // No cache entry
+	}
+	return mtimeNs, nil
+}
+
+// SetRepoMtime updates the mtime cache for a repository's data file.
+func (s *DoltStore) SetRepoMtime(ctx context.Context, repoPath, jsonlPath string, mtimeNs int64) error {
+	_, err := s.execContext(ctx, `
+		INSERT INTO repo_mtimes (repo_path, jsonl_path, mtime_ns, last_checked)
+		VALUES (?, ?, ?, NOW())
+		ON DUPLICATE KEY UPDATE
+			jsonl_path = VALUES(jsonl_path),
+			mtime_ns = VALUES(mtime_ns),
+			last_checked = NOW()
+	`, repoPath, jsonlPath, mtimeNs)
+	return err
 }
 
 func formatJSONStringArray(arr []string) string {

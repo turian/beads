@@ -230,8 +230,7 @@ bd version
 ```
 
 **Windows notes:**
-- The background daemon listens on a loopback TCP endpoint recorded in `.beads\bd.sock`
-- Keep that metadata file intact
+- The Dolt server listens on a loopback TCP endpoint
 - Allow `bd.exe` loopback traffic through any host firewall
 
 ## IDE and Editor Integrations
@@ -253,6 +252,7 @@ bd setup claude   # Claude Code - installs SessionStart/PreCompact hooks
 bd setup cursor   # Cursor IDE - creates .cursor/rules/beads.mdc
 bd setup aider    # Aider - creates .aider.conf.yml
 bd setup codex    # Codex CLI - creates/updates AGENTS.md
+bd setup mux      # Mux - creates/updates AGENTS.md
 ```
 
 **How it works:**
@@ -273,6 +273,7 @@ bd setup claude --check   # Check Claude Code integration
 bd setup cursor --check   # Check Cursor integration
 bd setup aider --check    # Check Aider integration
 bd setup codex --check    # Check Codex integration
+bd setup mux --check      # Check Mux integration
 ```
 
 ### Claude Code Plugin (Optional)
